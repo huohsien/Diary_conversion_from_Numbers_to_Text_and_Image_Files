@@ -1,0 +1,1 @@
+# Diary_conversion_from_Numbers_to_Text_and_Image_Files
