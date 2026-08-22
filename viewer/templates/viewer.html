@@ -1,0 +1,72 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ csv_name }}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header class="toolbar">
+        <div class="title">{{ csv_name }}</div>
+        <div class="summary">
+            {{ row_count }} rows × {{ col_count }} columns
+            {% if rows_with_images %}
+                · {{ rows_with_images | length }} rows contain images
+            {% endif %}
+        </div>
+    </header>
+
+    {% if rows_with_images %}
+    <div class="image-summary">
+        <strong>Rows with images:</strong>
+        {% for item in rows_with_images %}
+            <a href="#row-{{ item.row_number }}">
+                {{ item.row_number }}{% if item.image_count > 1 %} ({{ item.image_count }}){% endif %}
+            </a>{% if not loop.last %}, {% endif %}
+        {% endfor %}
+    </div>
+    {% endif %}
+
+    <main class="viewer">
+        <table>
+            <thead>
+                <tr>
+                    <th class="row-number corner">#</th>
+                    {% for col_index in range(col_count) %}
+                        <th>{{ column_name(col_index + 1) }}</th>
+                    {% endfor %}
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in rows %}
+                <tr id="row-{{ row.row_number }}">
+                    <th class="row-number">{{ row.row_number }}</th>
+
+                    {% for cell in row.cells %}
+                    <td>
+                        {% if cell.text %}
+                            <div class="cell-text">{{ cell.text }}</div>
+                        {% endif %}
+
+                        {% if cell.image_rel %}
+                            <a
+                                href="{{ url_for('exported_file', relative_path=cell.image_rel) }}"
+                                target="_blank"
+                            >
+                                <img
+                                    class="cell-image"
+                                    src="{{ url_for('exported_file', relative_path=cell.image_rel) }}"
+                                    loading="lazy"
+                                >
+                            </a>
+                        {% endif %}
+                    </td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </main>
+</body>
+</html>
