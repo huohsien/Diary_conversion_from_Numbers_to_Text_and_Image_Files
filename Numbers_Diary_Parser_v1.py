@@ -2,17 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 from datetime import date, datetime
+import ast
 import csv
 import importlib.util
 import json
 import os
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import time
 import webbrowser
 from urllib.error import URLError
+from urllib.parse import quote, unquote
 from urllib.request import urlopen
 
 import numbers_parser
@@ -21,11 +24,65 @@ from numbers_parser import Document
 
 IMG_FOLDER_NAME = "IMG"
 CSV_ENCODING = "utf-8-sig"
-IMAGE_AND_TEXT_SEPARATOR = "\n"
 
 viewer_process = None
 viewer_log_handle = None
 
+
+# ----------------------------------------------------------------------
+# Property-cell mini format
+# ----------------------------------------------------------------------
+
+def _property_escape(value):
+    if value is None:
+        return ""
+
+    return quote(
+        str(value),
+        safe=" /:#?&@,+-._~[]()!",
+        encoding="utf-8",
+        errors="strict",
+    )
+
+
+def _property_unescape(value):
+    return unquote(str(value), encoding="utf-8", errors="strict")
+
+
+def _serialize_properties(properties):
+    parts = []
+
+    for key, value in properties.items():
+        if value is None:
+            continue
+
+        if isinstance(value, bool):
+            value = 1 if value else 0
+
+        parts.append(f"{key}={_property_escape(value)}")
+
+    return ";".join(parts)
+
+
+def _parse_properties(text):
+    if not text:
+        return {}
+
+    result = {}
+
+    for token in str(text).split(";"):
+        if not token or "=" not in token:
+            continue
+
+        key, value = token.split("=", 1)
+        result[key] = _property_unescape(value)
+
+    return result
+
+
+# ----------------------------------------------------------------------
+# Numbers parsing helpers
+# ----------------------------------------------------------------------
 
 def _safe_filename(filename):
     filename = Path(str(filename)).name
@@ -65,7 +122,6 @@ def _rgb_to_hex(rgb):
         except Exception:
             return None
 
-    # Support either 0..1 floats or 0..255 values.
     if max(r, g, b) <= 1.0:
         r, g, b = r * 255, g * 255, b * 255
 
@@ -80,11 +136,7 @@ def _background_to_css(bg_color):
     if bg_color is None:
         return None
 
-    if isinstance(bg_color, (list, tuple)) and bg_color:
-        # RGB itself is tuple-like, so first detect RGB by attributes.
-        if hasattr(bg_color, "r"):
-            return _rgb_to_hex(bg_color)
-
+    if isinstance(bg_color, (list, tuple)) and not hasattr(bg_color, "r"):
         colors = [_rgb_to_hex(c) for c in bg_color]
         colors = [c for c in colors if c]
 
@@ -97,52 +149,123 @@ def _background_to_css(bg_color):
     return _rgb_to_hex(bg_color)
 
 
-def _alignment_value(alignment, name, index):
-    if alignment is None:
-        return None
-
-    value = getattr(alignment, name, None)
-
-    if value is None:
-        try:
-            value = alignment[index]
-        except Exception:
-            return None
-
-    if value is None:
-        return None
-
-    return str(value).lower()
-
-
 def _extract_cell_style(cell):
-    """
-    Serialize the cell-wide style properties that numbers-parser exposes.
-
-    Note: numbers-parser can read cell/paragraph style, but it does not expose
-    mixed character formatting inside one cell. The exported metadata therefore
-    represents the cell-wide style.
-    """
     style = getattr(cell, "style", None)
 
     if style is None:
         return {}
 
-    alignment = getattr(style, "alignment", None)
-
     return {
         "background": _background_to_css(getattr(style, "bg_color", None)),
         "font_color": _rgb_to_hex(getattr(style, "font_color", None)),
-        "font_size_pt": getattr(style, "font_size", None),
+        "font_size": getattr(style, "font_size", None),
         "font_name": getattr(style, "font_name", None),
         "bold": bool(getattr(style, "bold", False)),
         "italic": bool(getattr(style, "italic", False)),
         "underline": bool(getattr(style, "underline", False)),
-        "strikethrough": bool(getattr(style, "strikethrough", False)),
-        "horizontal_alignment": _alignment_value(alignment, "horizontal", 0),
-        "vertical_alignment": _alignment_value(alignment, "vertical", 1),
-        "text_inset_pt": getattr(style, "text_inset", None),
+        "strike": bool(getattr(style, "strikethrough", False)),
     }
+
+
+def _rich_text_dict(cell):
+    value = getattr(cell, "value", None)
+
+    if isinstance(value, dict):
+        return value
+
+    formatted = getattr(cell, "formatted_value", None)
+
+    if isinstance(formatted, dict):
+        return formatted
+
+    return None
+
+
+def _extract_hyperlinks(cell):
+    """
+    Prefer the public numbers-parser Cell.hyperlinks property.
+    Fall back to older rich-text dictionary representations.
+    """
+    raw_links = getattr(cell, "hyperlinks", None)
+
+    if not raw_links:
+        rich = _rich_text_dict(cell)
+        raw_links = rich.get("hyperlinks") if rich else []
+
+    links = []
+
+    for item in raw_links or []:
+        display_text = None
+        target_url = None
+
+        if isinstance(item, dict):
+            display_text = (
+                item.get("text")
+                or item.get("display")
+                or item.get("label")
+                or item.get("title")
+            )
+            target_url = (
+                item.get("url")
+                or item.get("href")
+                or item.get("target")
+            )
+
+        elif isinstance(item, (tuple, list)):
+            if len(item) >= 2:
+                display_text = item[0]
+                target_url = item[1]
+            elif len(item) == 1:
+                display_text = item[0]
+                target_url = item[0]
+
+        elif isinstance(item, str):
+            display_text = item
+            target_url = item
+
+        if display_text is None and target_url is not None:
+            display_text = target_url
+
+        if target_url is None and display_text is not None:
+            target_url = display_text
+
+        if display_text is None or target_url is None:
+            continue
+
+        links.append(
+            {
+                "text": str(display_text),
+                "url": str(target_url),
+            }
+        )
+
+    return links
+def _extract_visible_text_from_rich_value(value):
+    """
+    Normalize rich-text representations from different numbers-parser builds.
+    """
+    if isinstance(value, dict):
+        text_value = value.get("text")
+        if text_value is not None:
+            return str(text_value)
+
+    if isinstance(value, str):
+        stripped = value.strip()
+
+        # Defensive support for a stringified rich-text metadata dictionary,
+        # which is exactly what appeared in the 11:19 exported cell.
+        if stripped.startswith("{") and "'text'" in stripped:
+            try:
+                parsed = ast.literal_eval(stripped)
+            except (ValueError, SyntaxError):
+                parsed = None
+
+            if isinstance(parsed, dict) and parsed.get("text") is not None:
+                return str(parsed["text"])
+
+        return value
+
+    return None
 
 
 def _cell_value_as_text(cell):
@@ -154,24 +277,29 @@ def _cell_value_as_text(cell):
     if value is None:
         return ""
 
-    # Diary time cells should be compact 24-hour HH:MM, not ISO timestamps.
     if isinstance(cell, numbers_parser.cell.DateCell):
         try:
             return value.strftime("%H:%M")
         except Exception:
             pass
 
+    # For text/rich-text, trust value first. In the user's parser build,
+    # formatted_value can expose the whole rich-text metadata structure.
+    visible = _extract_visible_text_from_rich_value(value)
+    if visible is not None:
+        return visible
+
     formatted = getattr(cell, "formatted_value", None)
-    if formatted not in (None, ""):
-        return str(formatted)
+    visible = _extract_visible_text_from_rich_value(formatted)
+
+    if visible not in (None, ""):
+        return visible
 
     if isinstance(value, (datetime, date)):
         return value.isoformat()
 
     return str(value)
-
-
-def _extract_background_image(cell, img_dir, output_day_folder):
+def _extract_background_image(cell, img_dir):
     if isinstance(cell, numbers_parser.cell.MergedCell):
         return None
 
@@ -184,72 +312,215 @@ def _extract_background_image(cell, img_dir, output_day_folder):
     if not isinstance(bg_image, numbers_parser.cell.BackgroundImage):
         return None
 
-    original_filename = getattr(bg_image, "filename", None) or "image"
     image_data = getattr(bg_image, "data", None)
-
     if image_data is None:
         return None
 
+    original_filename = getattr(bg_image, "filename", None) or "image"
     destination = _unique_destination_path(img_dir, original_filename)
     destination.write_bytes(image_data)
 
-    return destination.relative_to(output_day_folder).as_posix()
+    return destination.name
 
 
-def _merge_span(cell):
+def _horizontal_span(cell):
     """
-    Return (rowspan, colspan) for a merge anchor.
-    numbers-parser exposes merge-anchor size as (rows, columns).
+    Only horizontal merge/span is part of this diary schema.
+    Vertical rowspan is intentionally not exported.
     """
     if isinstance(cell, numbers_parser.cell.MergedCell):
-        return None
+        return 0
 
     if not bool(getattr(cell, "is_merged", False)):
-        return (1, 1)
+        return 1
 
     size = getattr(cell, "size", None)
 
     if not size:
-        return (1, 1)
+        return 1
 
     try:
-        rowspan = int(size[0])
-        colspan = int(size[1])
+        # numbers-parser merge size is (rows, columns).
+        return max(1, int(size[1]))
     except Exception:
-        return (1, 1)
-
-    return (max(1, rowspan), max(1, colspan))
+        return 1
 
 
-def _table_geometry(table, row_count, col_count):
-    row_heights = []
-    col_widths = []
-
-    for r in range(row_count):
-        try:
-            row_heights.append(float(table.row_height(r)))
-        except Exception:
-            row_heights.append(None)
-
-    for c in range(col_count):
-        try:
-            col_widths.append(float(table.col_width(c)))
-        except Exception:
-            col_widths.append(None)
-
+def _empty_cell_properties(span=1):
     return {
-        "row_heights": row_heights,
-        "col_widths": col_widths,
+        "type": "empty",
+        "span": span,
     }
 
 
+def _logical_item_from_cell(cell, img_dir):
+    if isinstance(cell, numbers_parser.cell.MergedCell):
+        return None
+
+    text_value = _cell_value_as_text(cell)
+    image_filename = _extract_background_image(cell, img_dir)
+    span = _horizontal_span(cell)
+    style = _extract_cell_style(cell)
+    hyperlinks = _extract_hyperlinks(cell)
+
+    if text_value and image_filename:
+        item_type = "text_image"
+        data_value = text_value
+
+    elif image_filename:
+        item_type = "image"
+        data_value = image_filename
+
+    elif isinstance(cell, numbers_parser.cell.DateCell) and text_value:
+        item_type = "datetime"
+        data_value = text_value
+
+    elif text_value:
+        item_type = "text"
+        data_value = text_value
+
+    else:
+        item_type = "empty"
+        data_value = ""
+
+    props = {
+        "type": item_type,
+        "span": span,
+    }
+
+    if item_type == "text_image":
+        props["image_file"] = image_filename
+
+    if item_type in ("text", "text_image"):
+        for key in (
+            "background",
+            "font_color",
+            "font_size",
+            "font_name",
+            "bold",
+            "italic",
+            "underline",
+            "strike",
+        ):
+            value = style.get(key)
+            if value is not None:
+                props[key] = value
+
+        for i, link in enumerate(hyperlinks, start=1):
+            props[f"link{i}_text"] = link["text"]
+            props[f"link{i}_url"] = link["url"]
+
+    elif item_type == "image":
+        # Background color is still useful for visual inspection if present.
+        if style.get("background") is not None:
+            props["background"] = style["background"]
+
+    return data_value, props
+
+
+def _find_last_meaningful_source_col(table, row, img_dir):
+    """
+    Find the last physical source column containing actual diary content.
+
+    Ordinary empty cells BEFORE that point are intentional gaps and MUST be
+    preserved in the canonical CSV. Ordinary empty cells AFTER that point are
+    merely trailing table capacity and are omitted.
+    """
+    last_col = None
+
+    # This function MUST NOT extract images again, so inspect only presence.
+    for source_col in range(len(row)):
+        cell = table.cell(row.index if hasattr(row, "index") else 0, source_col)
+
+    return last_col
+
+
+def _has_background_image(cell):
+    if isinstance(cell, numbers_parser.cell.MergedCell):
+        return False
+
+    style = getattr(cell, "style", None)
+    if style is None:
+        return False
+
+    return isinstance(
+        getattr(style, "bg_image", None),
+        numbers_parser.cell.BackgroundImage,
+    )
+
+
+def _cell_has_meaningful_content(cell):
+    if isinstance(cell, numbers_parser.cell.MergedCell):
+        return False
+
+    if _has_background_image(cell):
+        return True
+
+    return bool(_cell_value_as_text(cell))
+
+
+def _table_layout_constants(table):
+    """
+    Inspection-only geometry.
+
+    The canonical CSV/property CSV does not store UI geometry. For the viewer,
+    we only retain the two Numbers template widths:
+      - time column width (A)
+      - basic content-column width (B, C, D, ...)
+    """
+    try:
+        time_width = float(table.col_width(0))
+    except Exception:
+        time_width = 64.0
+
+    widths = []
+
+    # Sample actual physical content columns. The user's diary template normally
+    # uses equal B/C/D/... widths and creates wider areas by merging cells.
+    try:
+        source_rows = table.rows()
+        max_cols = max((len(row) for row in source_rows), default=0)
+    except Exception:
+        max_cols = 0
+
+    for c in range(1, max_cols):
+        try:
+            width = float(table.col_width(c))
+            if width > 0:
+                widths.append(width)
+        except Exception:
+            pass
+
+    basic_width = statistics.median(widths) if widths else 120.0
+
+    return {
+        "time_column_width": time_width,
+        "basic_column_width": basic_width,
+    }
+
+
+# ----------------------------------------------------------------------
+# Canonical export
+# ----------------------------------------------------------------------
+
 def parse_numbers_file(numbers_file, output_root):
     """
-    Parse one .numbers diary file into CSV + IMG + viewer metadata.
+    Canonical output:
 
-    Merged continuation cells are skipped. Merge anchors carry rowspan/colspan
-    metadata so the browser viewer can reproduce the original merged layout.
-    Leading completely-empty table rows are omitted.
+        <day>.csv
+        <day>.properties.csv
+        IMG/
+
+    One Numbers diary row -> one CSV record.
+
+    Rules:
+    - merged continuation cells are skipped
+    - a merged anchor becomes ONE logical CSV item with property span=N
+    - an ordinary empty physical cell between two content items is preserved:
+          data CSV        -> empty field
+          properties CSV  -> type=empty;span=1
+    - trailing unused physical cells are omitted
+    - shorter records are padded only at the END to make rectangular CSV
     """
     numbers_file = Path(numbers_file).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
@@ -262,137 +533,280 @@ def parse_numbers_file(numbers_file, output_root):
 
     output_day_folder = output_root / numbers_file.stem
     img_dir = output_day_folder / IMG_FOLDER_NAME
-    csv_path = output_day_folder / f"{numbers_file.stem}.csv"
-    metadata_path = output_day_folder / f"{numbers_file.stem}.meta.json"
+    data_csv_path = output_day_folder / f"{numbers_file.stem}.csv"
+    properties_csv_path = output_day_folder / f"{numbers_file.stem}.properties.csv"
+    inspection_json_path = output_day_folder / f"{numbers_file.stem}.inspection.json"
 
     output_day_folder.mkdir(parents=True, exist_ok=True)
     img_dir.mkdir(parents=True, exist_ok=True)
 
     doc = Document(str(numbers_file))
 
-    total_sheets = len(doc.sheets)
-    total_tables = sum(len(sheet.tables) for sheet in doc.sheets)
+    data_rows = []
+    property_rows = []
 
-    all_csv_rows = []
-    tables_meta = []
+    # Inspection-only: preserve original row numbering / blank source rows,
+    # plus only the two template width constants. This does NOT enter canonical
+    # data or properties.
+    inspection_source_rows = []
+    layout_constants = None
 
-    for sheet_index, sheet in enumerate(doc.sheets):
-        sheet_name = getattr(sheet, "name", None) or f"Sheet {sheet_index + 1}"
+    for sheet in doc.sheets:
+        for table in sheet.tables:
+            if layout_constants is None:
+                layout_constants = _table_layout_constants(table)
 
-        for table_index, table in enumerate(sheet.tables):
-            table_name = getattr(table, "name", None) or f"Table {table_index + 1}"
             source_rows = table.rows()
-            source_row_count = len(source_rows)
-            source_col_count = max((len(row) for row in source_rows), default=0)
-
-            geometry = _table_geometry(
-                table,
-                source_row_count,
-                source_col_count,
-            )
-
-            table_rows_meta = []
-            seen_nonempty_row = False
 
             for source_row_index, row in enumerate(source_rows):
-                csv_row = []
-                row_cells_meta = []
-                row_has_content = False
+                meaningful_cols = []
 
                 for source_col_index in range(len(row)):
                     cell = table.cell(source_row_index, source_col_index)
 
-                    # Continuation pieces of merged regions must not appear as
-                    # extra empty cells in CSV or Viewer.
+                    if _cell_has_meaningful_content(cell):
+                        meaningful_cols.append(source_col_index)
+
+                if not meaningful_cols:
+                    inspection_source_rows.append(
+                        {
+                            "numbers_row": source_row_index + 1,
+                            "record_index": None,
+                        }
+                    )
+                    continue
+
+                last_meaningful_col = max(meaningful_cols)
+
+                data_row = []
+                property_row = []
+
+                for source_col_index in range(last_meaningful_col + 1):
+                    cell = table.cell(source_row_index, source_col_index)
+
+                    # A continuation part of B:C:D merge is NOT a logical item.
                     if isinstance(cell, numbers_parser.cell.MergedCell):
                         continue
 
-                    value_text = _cell_value_as_text(cell)
-                    image_rel_path = _extract_background_image(
+                    data_value, props = _logical_item_from_cell(
                         cell,
-                        img_dir,
-                        output_day_folder,
+                        img_dir=img_dir,
                     )
 
-                    if value_text and image_rel_path:
-                        csv_text = (
-                            value_text
-                            + IMAGE_AND_TEXT_SEPARATOR
-                            + image_rel_path
-                        )
-                    elif image_rel_path:
-                        csv_text = image_rel_path
-                    else:
-                        csv_text = value_text
+                    data_row.append(data_value)
+                    property_row.append(_serialize_properties(props))
 
-                    rowspan, colspan = _merge_span(cell)
+                record_index = len(data_rows)
+                data_rows.append(data_row)
+                property_rows.append(property_row)
 
-                    csv_row.append(csv_text)
-                    row_cells_meta.append(
-                        {
-                            "source_col": source_col_index,
-                            "rowspan": rowspan,
-                            "colspan": colspan,
-                            "style": _extract_cell_style(cell),
-                        }
-                    )
-
-                    if value_text or image_rel_path:
-                        row_has_content = True
-
-                # Drop only blank rows at the beginning of a table.
-                if not seen_nonempty_row and not row_has_content:
-                    continue
-
-                seen_nonempty_row = True
-
-                all_csv_rows.append(csv_row)
-                table_rows_meta.append(
+                inspection_source_rows.append(
                     {
-                        "source_row": source_row_index,
-                        "cells": row_cells_meta,
+                        "numbers_row": source_row_index + 1,
+                        "record_index": record_index,
                     }
                 )
 
-            tables_meta.append(
-                {
-                    "sheet_name": sheet_name,
-                    "table_name": table_name,
-                    "source_row_count": source_row_count,
-                    "source_col_count": source_col_count,
-                    "row_heights": geometry["row_heights"],
-                    "col_widths": geometry["col_widths"],
-                    "rows": table_rows_meta,
-                }
-            )
+    max_items = max((len(row) for row in data_rows), default=0)
 
-    with csv_path.open("w", newline="", encoding=CSV_ENCODING) as fp:
-        writer = csv.writer(fp)
-        writer.writerows(all_csv_rows)
+    data_rows = [
+        row + [""] * (max_items - len(row))
+        for row in data_rows
+    ]
+    property_rows = [
+        row + [""] * (max_items - len(row))
+        for row in property_rows
+    ]
 
-    metadata = {
-        "source": str(numbers_file),
-        "csv": str(csv_path),
-        "img_folder": str(img_dir),
-        "tables": tables_meta,
-    }
+    with data_csv_path.open("w", newline="", encoding=CSV_ENCODING) as fp:
+        csv.writer(fp).writerows(data_rows)
 
-    metadata_path.write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    with properties_csv_path.open("w", newline="", encoding=CSV_ENCODING) as fp:
+        csv.writer(fp).writerows(property_rows)
+
+    build_inspection_json(
+        data_csv_path=data_csv_path,
+        properties_csv_path=properties_csv_path,
+        inspection_json_path=inspection_json_path,
+        inspection_source_rows=inspection_source_rows,
+        layout_constants=layout_constants or {
+            "time_column_width": 64.0,
+            "basic_column_width": 120.0,
+        },
     )
 
     return {
         "source": str(numbers_file),
         "output_folder": str(output_day_folder),
-        "csv": str(csv_path),
-        "metadata": str(metadata_path),
+        "csv": str(data_csv_path),
+        "properties_csv": str(properties_csv_path),
         "img_folder": str(img_dir),
-        "sheet_count": total_sheets,
-        "table_count": total_tables,
+        "inspection_json": str(inspection_json_path),
     }
 
 
+# ----------------------------------------------------------------------
+# Derived inspection JSON
+# ----------------------------------------------------------------------
+
+def _property_number(props, key, default=None, cast=float):
+    value = props.get(key)
+
+    if value in (None, ""):
+        return default
+
+    try:
+        return cast(value)
+    except Exception:
+        return default
+
+
+def build_inspection_json(
+    data_csv_path,
+    properties_csv_path,
+    inspection_json_path,
+    inspection_source_rows,
+    layout_constants,
+):
+    """
+    Viewer data is reconstructed from canonical data+properties.
+
+    The ONLY extra inspection-only source information is:
+      - original Numbers row numbering / blank rows
+      - time-column width
+      - basic content-column width
+
+    No row heights or per-cell widths are copied from Numbers.
+    """
+    data_csv_path = Path(data_csv_path)
+    properties_csv_path = Path(properties_csv_path)
+    inspection_json_path = Path(inspection_json_path)
+
+    with data_csv_path.open("r", encoding=CSV_ENCODING, newline="") as fp:
+        data_rows = list(csv.reader(fp))
+
+    with properties_csv_path.open("r", encoding=CSV_ENCODING, newline="") as fp:
+        property_rows = list(csv.reader(fp))
+
+    if len(data_rows) != len(property_rows):
+        raise ValueError(
+            "Data CSV and properties CSV do not have the same row count."
+        )
+
+    records = []
+    max_physical_columns = 1  # A = time column.
+
+    for record_index, (data_row, prop_row) in enumerate(
+        zip(data_rows, property_rows)
+    ):
+        if len(data_row) != len(prop_row):
+            raise ValueError(
+                f"CSV shape mismatch at record row {record_index + 1}."
+            )
+
+        cells = []
+        physical_col = 0
+
+        for logical_index, (value, prop_text) in enumerate(
+            zip(data_row, prop_row)
+        ):
+            # Trailing rectangular padding.
+            if value == "" and prop_text == "":
+                continue
+
+            props = _parse_properties(prop_text)
+            item_type = props.get("type", "text")
+            span = max(1, int(_property_number(props, "span", 1, int)))
+
+            style = {
+                "background": props.get("background"),
+                "font_color": props.get("font_color"),
+                "font_size": _property_number(
+                    props,
+                    "font_size",
+                    None,
+                    float,
+                ),
+                "font_name": props.get("font_name"),
+                "bold": props.get("bold") == "1",
+                "italic": props.get("italic") == "1",
+                "underline": props.get("underline") == "1",
+                "strike": props.get("strike") == "1",
+            }
+
+            links = []
+            i = 1
+
+            while True:
+                text_key = f"link{i}_text"
+                url_key = f"link{i}_url"
+
+                if text_key not in props and url_key not in props:
+                    break
+
+                links.append(
+                    {
+                        "text": props.get(text_key, ""),
+                        "url": props.get(url_key, ""),
+                    }
+                )
+                i += 1
+
+            cell = {
+                "logical_index": logical_index,
+                "type": item_type,
+                "value": value,
+                "span": span,
+                "physical_col": physical_col,
+                "style": style,
+                "links": links,
+                "image_file": (
+                    value
+                    if item_type == "image"
+                    else props.get("image_file")
+                ),
+            }
+
+            cells.append(cell)
+            physical_col += span
+
+        max_physical_columns = max(
+            max_physical_columns,
+            physical_col,
+        )
+
+        records.append(
+            {
+                "record_index": record_index,
+                "cells": cells,
+            }
+        )
+
+    payload = {
+        "data_csv": data_csv_path.name,
+        "properties_csv": properties_csv_path.name,
+        "time_column_width": float(
+            layout_constants["time_column_width"]
+        ),
+        "basic_column_width": float(
+            layout_constants["basic_column_width"]
+        ),
+        "max_physical_columns": max_physical_columns,
+        "source_rows": inspection_source_rows,
+        "records": records,
+    }
+
+    inspection_json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return inspection_json_path
+
+
+# ----------------------------------------------------------------------
+# Viewer lifecycle
+# ----------------------------------------------------------------------
 
 def _viewer_ready(url):
     try:
@@ -424,6 +838,7 @@ def _terminate_pid(pid, timeout=5):
         return False
 
     deadline = time.monotonic() + timeout
+
     while time.monotonic() < deadline:
         if not _pid_is_alive(pid):
             return True
@@ -432,34 +847,27 @@ def _terminate_pid(pid, timeout=5):
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
-        return True
+        pass
 
     return True
 
 
 def _listener_pids_on_port(port):
-    """
-    macOS fallback used after a kernel restart, when the old subprocess object
-    is gone but the old Flask process is still listening on the fixed port.
-    """
-    try:
-        completed = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-    except FileNotFoundError:
-        return []
+    completed = subprocess.run(
+        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
-    pids = []
-    for line in completed.stdout.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            pids.append(int(line))
-
-    return sorted(set(pids))
+    return sorted(
+        {
+            int(line.strip())
+            for line in completed.stdout.splitlines()
+            if line.strip().isdigit()
+        }
+    )
 
 
 def _process_command(pid):
@@ -479,15 +887,7 @@ def _is_our_viewer_process(pid, viewer_app):
     if not command:
         return False
 
-    viewer_app = str(Path(viewer_app).resolve())
-
-    return (
-        viewer_app in command
-        or (
-            "viewer/app.py" in command
-            and "Numbers_Diary" in command
-        )
-    )
+    return str(Path(viewer_app).resolve()) in command
 
 
 def _close_log_handle():
@@ -506,7 +906,6 @@ def _stop_in_memory_viewer():
     global viewer_process
 
     if viewer_process is not None and viewer_process.poll() is None:
-        pid = viewer_process.pid
         viewer_process.terminate()
 
         try:
@@ -515,48 +914,31 @@ def _stop_in_memory_viewer():
             viewer_process.kill()
             viewer_process.wait(timeout=5)
 
-        print(f"Stopped Notebook Viewer process: PID {pid}")
-
     viewer_process = None
     _close_log_handle()
 
 
 def _stop_stale_viewer(viewer_app, viewer_port, pid_file):
-    """
-    Stop the previous Numbers Diary Viewer even after a Jupyter kernel restart.
-
-    Order:
-    1. Stop the subprocess object still known by this kernel.
-    2. Stop the PID written by the previous Viewer.
-    3. macOS fallback: inspect the process listening on the fixed port and
-       terminate it only if its command line identifies this Viewer app.
-
-    An unrelated service using the same port is never killed automatically.
-    """
     _stop_in_memory_viewer()
 
-    stale_pids = []
+    candidate_pids = []
 
     if pid_file.is_file():
         try:
-            stale_pids.append(int(pid_file.read_text(encoding="utf-8").strip()))
+            candidate_pids.append(
+                int(pid_file.read_text(encoding="utf-8").strip())
+            )
         except Exception:
             pass
 
     for pid in _listener_pids_on_port(viewer_port):
-        if pid not in stale_pids:
-            stale_pids.append(pid)
+        if pid not in candidate_pids:
+            candidate_pids.append(pid)
 
-    for pid in stale_pids:
-        if not _pid_is_alive(pid):
-            continue
-
-        if _is_our_viewer_process(pid, viewer_app):
+    for pid in candidate_pids:
+        if _pid_is_alive(pid) and _is_our_viewer_process(pid, viewer_app):
             _terminate_pid(pid)
-            print(f"Stopped stale Numbers Diary Viewer: PID {pid}")
 
-    # Wait briefly for macOS to release the fixed port.
-    local_url = f"http://127.0.0.1:{int(viewer_port)}/"
     deadline = time.monotonic() + 5
 
     while time.monotonic() < deadline:
@@ -565,11 +947,12 @@ def _stop_stale_viewer(viewer_app, viewer_port, pid_file):
         if not listeners:
             break
 
-        # If the remaining listener is not ours, do not kill it.
-        if all(not _is_our_viewer_process(pid, viewer_app) for pid in listeners):
+        if all(
+            not _is_our_viewer_process(pid, viewer_app)
+            for pid in listeners
+        ):
             raise RuntimeError(
-                f"Port {viewer_port} is already used by another application.\n"
-                "The Numbers Diary Parser will not kill an unrelated process."
+                f"Port {viewer_port} is used by another application."
             )
 
         time.sleep(0.1)
@@ -581,9 +964,6 @@ def _stop_stale_viewer(viewer_app, viewer_port, pid_file):
 
 
 def stop_numbers_viewer(viewer_port=8766):
-    """
-    Stop the Viewer started by this Notebook or a previous kernel session.
-    """
     module_root = Path(__file__).resolve().parent
     viewer_app = module_root / "viewer" / "app.py"
     pid_file = module_root / "viewer" / ".numbers_diary_viewer.pid"
@@ -598,17 +978,10 @@ def stop_numbers_viewer(viewer_port=8766):
 
 
 def display_numbers_export(result, viewer_port=8766):
-    """
-    Restart the fixed-port standalone Viewer and open it in the default browser.
-
-    The port stays fixed at 8766. A previous Viewer is explicitly terminated
-    first, including one left behind by a Jupyter kernel restart.
-    """
     global viewer_process, viewer_log_handle
 
     output_folder = Path(result["output_folder"]).expanduser().resolve()
-    csv_path = Path(result["csv"]).expanduser().resolve()
-    metadata_path = Path(result["metadata"]).expanduser().resolve()
+    inspection_json_path = Path(result["inspection_json"]).expanduser().resolve()
 
     module_root = Path(__file__).resolve().parent
     viewer_app = module_root / "viewer" / "app.py"
@@ -619,29 +992,16 @@ def display_numbers_export(result, viewer_port=8766):
     if not viewer_app.is_file():
         raise FileNotFoundError(f"Viewer app was not found:\n{viewer_app}")
 
-    if not csv_path.is_file():
-        raise FileNotFoundError(f"Parsed CSV was not found:\n{csv_path}")
-
-    if not metadata_path.is_file():
-        raise FileNotFoundError(f"Viewer metadata was not found:\n{metadata_path}")
-
     if importlib.util.find_spec("flask") is None:
-        subprocess.check_call([
-            sys.executable,
-            "-m",
-            "pip",
-            "install",
-            "Flask",
-        ])
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "Flask"]
+        )
 
     viewer_config.write_text(
         json.dumps(
             {
                 "output_folder": str(output_folder),
-                "csv_path": str(csv_path),
-                "metadata_path": str(metadata_path),
-                "img_folder_name": IMG_FOLDER_NAME,
-                "csv_encoding": CSV_ENCODING,
+                "inspection_json": str(inspection_json_path),
             },
             ensure_ascii=False,
             indent=2,
@@ -649,7 +1009,6 @@ def display_numbers_export(result, viewer_port=8766):
         encoding="utf-8",
     )
 
-    # Important: always stop the previous fixed-port Viewer first.
     _stop_stale_viewer(
         viewer_app=viewer_app,
         viewer_port=viewer_port,
@@ -702,7 +1061,6 @@ def display_numbers_export(result, viewer_port=8766):
     print(f"Numbers Diary Viewer: {local_url}")
     print(f"Viewer server log: {viewer_log}")
 
-    # Cache-busting query gives the browser a genuinely new navigation target.
     browser_url = f"{local_url}?opened={time.time_ns()}"
     opened = webbrowser.open_new_tab(browser_url)
 

@@ -2,7 +2,7 @@ html,
 body {
     margin: 0;
     padding: 0;
-    background: #f5f5f7;
+    background: #fff;
     color: #111;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -10,7 +10,7 @@ body {
 .toolbar {
     position: sticky;
     top: 0;
-    z-index: 30;
+    z-index: 100;
     display: flex;
     gap: 18px;
     align-items: baseline;
@@ -37,38 +37,152 @@ body {
 table {
     border-collapse: collapse;
     table-layout: fixed;
+    width: max-content;
     min-width: max-content;
     font-size: 13px;
 }
 
+.row-number-column {
+    width: 42px;
+}
+
+.time-column {
+    width: var(--time-width);
+}
+
+.basic-column {
+    width: var(--basic-width);
+}
+
+th,
 td {
     box-sizing: border-box;
     border: 1px solid #c9c9c9;
-    padding: 5px;
-    vertical-align: top;
-    background-clip: padding-box;
+    padding: 0;
     overflow: hidden;
 }
 
-.time-cell {
+thead th {
+    position: sticky;
+    top: 0;
+    z-index: 60;
+    height: 28px;
+    padding: 3px 6px;
+    background: #bfc0c0;
+    color: #444;
+    font-weight: 500;
+    text-align: center;
+    vertical-align: middle;
+}
+
+.corner {
     position: sticky;
     left: 0;
-    z-index: 8;
-    min-width: 68px;
-    width: 68px;
+    z-index: 80;
+    width: 42px;
+    min-width: 42px;
+    background: #bfc0c0;
+}
+
+.row-header {
+    position: sticky;
+    left: 0;
+    z-index: 50;
+    width: 42px;
+    min-width: 42px;
+    padding: 3px 7px;
+    background: #ececee;
+    color: #555;
+    font-weight: 500;
+    text-align: right;
+    vertical-align: middle;
+}
+
+.diary-cell {
+    vertical-align: top;
+    background: #fff;
+}
+
+.time-cell {
+    width: var(--time-width);
+    min-width: var(--time-width);
+    background: #dedede;
+    text-align: center;
+    vertical-align: middle;
+}
+
+.time-value {
+    padding: 4px 6px;
     white-space: nowrap;
-    font-variant-numeric: tabular-nums;
+    font-weight: 700;
+    text-align: center;
 }
 
-.cell-text {
+.text-value {
+    box-sizing: border-box;
+    padding: 6px 8px;
     white-space: pre-wrap;
-    overflow-wrap: anywhere;
+    overflow-wrap: break-word;
+    word-break: normal;
+    text-align: left;
+    vertical-align: top;
+    line-height: 1.28;
 }
 
-.cell-image {
-    display: block;
+.empty-cell,
+.blank-cell {
+    background: #fff;
+}
+
+.image-cell {
+    vertical-align: middle;
+    text-align: center;
+}
+
+.image-fit {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     width: 100%;
+
+    /*
+     * Numbers-like rule:
+     * a one-column square image establishes the baseline image-row height.
+     * Portrait/landscape images fit INSIDE the row without changing aspect ratio.
+     * JavaScript may enlarge this container when the row's text needs more height.
+     */
     height: auto;
-    max-height: 340px;
+    overflow: hidden;
+    background: transparent;
+}
+
+.image-fit img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: 100%;
+    max-height: 100%;
     object-fit: contain;
+    object-position: center center;
+}
+
+.rich-link {
+    color: #0066cc;
+    text-decoration: underline;
+}
+
+
+/* Explicitly override any inherited/flex alignment for diary text. */
+.diary-cell .text-value {
+    display: block;
+    margin: 0;
+    text-align: left !important;
+    vertical-align: top !important;
+}
+
+/* Numbers-like header/ruler treatment. */
+.column-header,
+.row-header,
+.corner {
+    user-select: none;
 }

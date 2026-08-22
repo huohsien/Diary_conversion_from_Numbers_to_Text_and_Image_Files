@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import csv
 import json
 import os
 from pathlib import Path
@@ -23,54 +22,30 @@ CONFIG = None
 
 def load_config(config_path):
     payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
-
-    for key in ("output_folder", "csv_path", "metadata_path"):
-        payload[key] = Path(payload[key]).expanduser().resolve()
-
+    payload["output_folder"] = Path(payload["output_folder"]).expanduser().resolve()
+    payload["inspection_json"] = Path(payload["inspection_json"]).expanduser().resolve()
     return payload
 
 
-def image_relative_path(cell_text):
-    if not cell_text:
-        return None
+def column_name(index_zero_based):
+    n = int(index_zero_based) + 1
+    result = ""
 
-    img_prefix = str(CONFIG["img_folder_name"]) + "/"
+    while n:
+        n, remainder = divmod(n - 1, 26)
+        result = chr(65 + remainder) + result
 
-    for line in str(cell_text).splitlines():
-        stripped = line.strip()
-
-        if stripped.startswith(img_prefix):
-            candidate = (CONFIG["output_folder"] / stripped).resolve()
-            output_root = CONFIG["output_folder"].resolve()
-
-            if candidate != output_root and output_root not in candidate.parents:
-                return None
-
-            if candidate.is_file():
-                return stripped
-
-    return None
+    return result
 
 
-def text_without_image_path(cell_text):
-    if not cell_text:
-        return ""
+app.jinja_env.globals["column_name"] = column_name
 
-    img_prefix = str(CONFIG["img_folder_name"]) + "/"
 
-    kept = [
-        line
-        for line in str(cell_text).splitlines()
-        if not line.strip().startswith(img_prefix)
+def css_text_style(style):
+    parts = [
+        "text-align:left",
+        "vertical-align:top",
     ]
-    return "\n".join(kept).strip()
-
-
-def css_style(style):
-    if not style:
-        return ""
-
-    parts = []
 
     if style.get("background"):
         parts.append(f"background:{style['background']}")
@@ -78,8 +53,8 @@ def css_style(style):
     if style.get("font_color"):
         parts.append(f"color:{style['font_color']}")
 
-    if style.get("font_size_pt"):
-        parts.append(f"font-size:{style['font_size_pt']}pt")
+    if style.get("font_size") is not None:
+        parts.append(f"font-size:{style['font_size']}pt")
 
     if style.get("font_name"):
         font_name = str(style["font_name"]).replace('"', '\\"')
@@ -92,118 +67,158 @@ def css_style(style):
         parts.append("font-style:italic")
 
     decorations = []
+
     if style.get("underline"):
         decorations.append("underline")
-    if style.get("strikethrough"):
+
+    if style.get("strike"):
         decorations.append("line-through")
+
     if decorations:
         parts.append("text-decoration:" + " ".join(decorations))
-
-    horizontal = style.get("horizontal_alignment")
-    if horizontal in ("left", "center", "right", "justify"):
-        parts.append(f"text-align:{horizontal}")
-
-    vertical = style.get("vertical_alignment")
-    if vertical == "top":
-        parts.append("vertical-align:top")
-    elif vertical in ("middle", "center"):
-        parts.append("vertical-align:middle")
-    elif vertical == "bottom":
-        parts.append("vertical-align:bottom")
-
-    inset = style.get("text_inset_pt")
-    if inset is not None:
-        try:
-            parts.append(f"padding-left:{float(inset)}pt")
-            parts.append(f"padding-right:{float(inset)}pt")
-        except Exception:
-            pass
 
     return ";".join(parts)
 
 
-@app.route("/")
-def index():
-    with CONFIG["csv_path"].open(
-        "r",
-        encoding=CONFIG["csv_encoding"],
-        newline="",
-    ) as fp:
-        csv_rows = list(csv.reader(fp))
+def split_text_into_link_segments(text, links):
+    if not text:
+        return []
 
-    metadata = json.loads(
-        CONFIG["metadata_path"].read_text(encoding="utf-8")
-    )
+    if not links:
+        return [{"text": text, "url": None}]
 
-    # Current diary files use one table. If there are multiple tables,
-    # render them sequentially.
-    csv_index = 0
-    display_tables = []
-    total_image_rows = []
+    matches = []
 
-    for table_meta in metadata.get("tables", []):
-        display_rows = []
+    for link in links:
+        display_text = str(link.get("text") or "")
+        url = str(link.get("url") or "")
 
-        for row_meta in table_meta.get("rows", []):
-            if csv_index >= len(csv_rows):
+        if not display_text or not url:
+            continue
+
+        start = 0
+
+        while True:
+            idx = text.find(display_text, start)
+
+            if idx < 0:
                 break
 
-            csv_row = csv_rows[csv_index]
-            csv_index += 1
-
-            cells = []
-            row_has_image = False
-
-            for cell_index, cell_meta in enumerate(row_meta.get("cells", [])):
-                cell_text = csv_row[cell_index] if cell_index < len(csv_row) else ""
-                image_rel = image_relative_path(cell_text)
-
-                if image_rel:
-                    row_has_image = True
-
-                cells.append(
-                    {
-                        "text": text_without_image_path(cell_text),
-                        "image_rel": image_rel,
-                        "rowspan": int(cell_meta.get("rowspan", 1)),
-                        "colspan": int(cell_meta.get("colspan", 1)),
-                        "source_col": int(cell_meta.get("source_col", cell_index)),
-                        "style": css_style(cell_meta.get("style", {})),
-                    }
-                )
-
-            if row_has_image:
-                total_image_rows.append(len(total_image_rows) + 1)
-
-            source_row = int(row_meta.get("source_row", 0))
-            row_height = None
-            row_heights = table_meta.get("row_heights", [])
-
-            if 0 <= source_row < len(row_heights):
-                row_height = row_heights[source_row]
-
-            display_rows.append(
+            matches.append(
                 {
-                    "source_row": source_row,
-                    "height": row_height,
-                    "cells": cells,
+                    "start": idx,
+                    "end": idx + len(display_text),
+                    "text": display_text,
+                    "url": url,
+                }
+            )
+            start = idx + len(display_text)
+
+    matches.sort(key=lambda item: (item["start"], item["end"]))
+
+    accepted = []
+    last_end = -1
+
+    for match in matches:
+        if match["start"] < last_end:
+            continue
+
+        accepted.append(match)
+        last_end = match["end"]
+
+    segments = []
+    cursor = 0
+
+    for match in accepted:
+        if match["start"] > cursor:
+            segments.append(
+                {
+                    "text": text[cursor:match["start"]],
+                    "url": None,
                 }
             )
 
-        display_tables.append(
+        segments.append(
             {
-                "sheet_name": table_meta.get("sheet_name"),
-                "table_name": table_meta.get("table_name"),
-                "col_widths": table_meta.get("col_widths", []),
-                "rows": display_rows,
+                "text": match["text"],
+                "url": match["url"],
+            }
+        )
+        cursor = match["end"]
+
+    if cursor < len(text):
+        segments.append(
+            {
+                "text": text[cursor:],
+                "url": None,
+            }
+        )
+
+    return segments
+
+
+@app.route("/")
+def index():
+    payload = json.loads(
+        CONFIG["inspection_json"].read_text(encoding="utf-8")
+    )
+
+    records = {
+        int(record["record_index"]): record
+        for record in payload.get("records", [])
+    }
+
+    rows = []
+
+    for source_row in payload.get("source_rows", []):
+        record_index = source_row.get("record_index")
+
+        if record_index is None:
+            rows.append(
+                {
+                    "numbers_row": int(source_row["numbers_row"]),
+                    "cells": [],
+                }
+            )
+            continue
+
+        record = records[int(record_index)]
+        cells = []
+
+        for cell in record.get("cells", []):
+            item_type = cell.get("type", "text")
+            value = cell.get("value", "")
+            links = cell.get("links") or []
+
+            cells.append(
+                {
+                    "type": item_type,
+                    "value": value,
+                    "span": int(cell.get("span", 1)),
+                    "style": css_text_style(cell.get("style") or {}),
+                    "segments": (
+                        split_text_into_link_segments(value, links)
+                        if item_type in ("text", "text_image")
+                        else []
+                    ),
+                    "image_file": cell.get("image_file"),
+                }
+            )
+
+        rows.append(
+            {
+                "numbers_row": int(source_row["numbers_row"]),
+                "cells": cells,
             }
         )
 
     return render_template(
         "viewer.html",
-        csv_name=CONFIG["csv_path"].name,
-        tables=display_tables,
-        row_count=len(csv_rows),
+        title=payload.get("data_csv", "Numbers Diary Inspection"),
+        time_width=float(payload.get("time_column_width", 64.0)),
+        basic_width=float(payload.get("basic_column_width", 120.0)),
+        max_physical_columns=int(payload.get("max_physical_columns", 1)),
+        rows=rows,
     )
 
 
@@ -241,6 +256,7 @@ if __name__ == "__main__":
             try:
                 if pid_file.is_file():
                     recorded = pid_file.read_text(encoding="utf-8").strip()
+
                     if recorded == str(os.getpid()):
                         pid_file.unlink()
             except Exception:
