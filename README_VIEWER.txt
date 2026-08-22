@@ -1,22 +1,19 @@
-Files to place in the repository root:
+This revision fixes Viewer lifecycle.
 
-Numbers_Diary_Parser_v1.ipynb
-Numbers_Diary_Parser_v1.py
-viewer/
-    app.py
-    templates/viewer.html
-    static/style.css
+Behavior:
+- Fixed Viewer port: 8766. It does NOT silently move to 8767/8768.
+- Before every Viewer start, the previous Numbers Diary Viewer is stopped.
+- The Viewer writes viewer/.numbers_diary_viewer.pid.
+- After a Jupyter kernel restart, the helper can still stop the stale Viewer by PID.
+- macOS fallback uses lsof + ps and only terminates a listener when its command
+  identifies this Numbers Diary viewer/app.py. It will not kill an unrelated app.
+- Browser open uses a cache-busting query so each run creates a fresh navigation.
+- Notebook imports the helper with importlib.reload(), so editing/replacing the .py
+  does not require restarting the Jupyter kernel.
+- Default output root is now ~/Downloads/Diary Export Test.
 
-Run the Notebook from top to bottom.
-
-The fourth cell remains exactly:
-
+Notebook remains 4 cells. Cell 4 remains:
     display_numbers_export(result)
 
-That function now follows the Telegram Viewer pattern:
-it starts viewer/app.py with subprocess.Popen(), waits for Flask to answer,
-then opens http://127.0.0.1:8766/ in the default browser.
-
-If needed, stop it from any notebook cell with:
-
+Manual stop, if wanted:
     stop_numbers_viewer()

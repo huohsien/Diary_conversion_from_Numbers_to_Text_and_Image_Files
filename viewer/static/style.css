@@ -14,7 +14,7 @@ body {
     display: flex;
     gap: 18px;
     align-items: baseline;
-    padding: 10px 14px;
+    padding: 8px 12px;
     background: #1d1d1f;
     color: #fff;
 }
@@ -28,71 +28,47 @@ body {
     font-size: 13px;
 }
 
-.image-summary {
-    padding: 8px 14px;
-    border-bottom: 1px solid #c9c9c9;
-    background: #fff;
-    font-size: 13px;
-}
-
-.image-summary a {
-    color: #0057b8;
-    text-decoration: none;
-}
-
 .viewer {
-    height: calc(100vh - 76px);
+    height: calc(100vh - 38px);
     overflow: auto;
     background: #fff;
 }
 
 table {
     border-collapse: collapse;
+    table-layout: fixed;
     min-width: max-content;
     font-size: 13px;
 }
 
-th,
 td {
+    box-sizing: border-box;
     border: 1px solid #c9c9c9;
     padding: 5px;
     vertical-align: top;
-    background: #fff;
+    background-clip: padding-box;
+    overflow: hidden;
 }
 
-thead th {
-    position: sticky;
-    top: 0;
-    z-index: 10;
-    min-width: 90px;
-    background: #e9e9eb;
-}
-
-.row-number {
+.time-cell {
     position: sticky;
     left: 0;
     z-index: 8;
-    min-width: 42px;
-    width: 42px;
-    text-align: right;
-    background: #f2f2f2;
-}
-
-.corner {
-    z-index: 20;
+    min-width: 68px;
+    width: 68px;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
 }
 
 .cell-text {
-    min-width: 100px;
-    max-width: 440px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
 
 .cell-image {
     display: block;
-    max-width: 220px;
-    max-height: 280px;
-    margin-top: 3px;
+    width: 100%;
+    height: auto;
+    max-height: 340px;
     object-fit: contain;
 }
