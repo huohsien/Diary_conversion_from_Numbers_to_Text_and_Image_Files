@@ -19,6 +19,8 @@ app = Flask(
 
 CONFIG = None
 
+NUMBERS_SOURCE_BASIC_COLUMN_WIDTH = 98.0
+
 
 def load_config(config_path):
     payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -185,6 +187,23 @@ def index():
         record = records[int(record_index)]
         cells = []
 
+        explicit_row_height = record.get("row_height")
+        display_row_height = None
+        if explicit_row_height is not None:
+            try:
+                basic_width = float(payload.get("basic_column_width", 120.0))
+                source_basic_width = float(
+                    payload.get(
+                        "source_basic_column_width",
+                        NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
+                    )
+                )
+                display_row_height = (
+                    float(explicit_row_height) * basic_width / source_basic_width
+                )
+            except Exception:
+                display_row_height = None
+
         for cell in record.get("cells", []):
             item_type = cell.get("type", "text")
             value = cell.get("value", "")
@@ -209,6 +228,7 @@ def index():
             {
                 "numbers_row": int(source_row["numbers_row"]),
                 "cells": cells,
+                "display_row_height": display_row_height,
             }
         )
 

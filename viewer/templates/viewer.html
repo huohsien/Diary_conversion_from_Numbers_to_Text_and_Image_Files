@@ -42,7 +42,12 @@
 
             <tbody>
                 {% for row in rows %}
-                <tr class="diary-row">
+                <tr
+                    class="diary-row"
+                    {% if row.display_row_height %}
+                        data-explicit-row-height="{{ row.display_row_height }}"
+                    {% endif %}
+                >
                     <th class="row-header">
                         {{ row.numbers_row }}
                     </th>

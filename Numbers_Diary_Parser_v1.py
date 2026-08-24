@@ -9,9 +9,10 @@ import json
 import os
 import re
 import signal
-import statistics
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import webbrowser
 from urllib.error import URLError
@@ -27,6 +28,14 @@ CSV_ENCODING = "utf-8-sig"
 
 viewer_process = None
 viewer_log_handle = None
+
+# Property-driven viewer uses the fixed diary-template display widths from the
+# verified dual-CSV viewer. Canonical row heights are stored only when the
+# Numbers file contains an explicit/manual height.
+PROPERTY_TIME_COLUMN_WIDTH = 64.0
+PROPERTY_BASIC_COLUMN_WIDTH = 120.0
+NUMBERS_SOURCE_BASIC_COLUMN_WIDTH = 98.0
+NUMBERS_DEFAULT_ROW_HEIGHT = 20.0
 
 
 # ----------------------------------------------------------------------
@@ -165,6 +174,7 @@ def _extract_cell_style(cell):
         "underline": bool(getattr(style, "underline", False)),
         "strike": bool(getattr(style, "strikethrough", False)),
     }
+
 
 
 def _rich_text_dict(cell):
@@ -459,43 +469,95 @@ def _cell_has_meaningful_content(cell):
     return bool(_cell_value_as_text(cell))
 
 
-def _table_layout_constants(table):
+# ----------------------------------------------------------------------
+# Diary date / output hierarchy
+# ----------------------------------------------------------------------
+
+_MONTH_NAMES = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def _find_diary_date(doc, numbers_file):
     """
-    Inspection-only geometry.
+    Prefer the actual DateCell stored in the Numbers diary. This removes the
+    need for a manually configured TEST_YEAR in V1.
 
-    The canonical CSV/property CSV does not store UI geometry. For the viewer,
-    we only retain the two Numbers template widths:
-      - time column width (A)
-      - basic content-column width (B, C, D, ...)
+    Fallbacks are intentionally conservative: parse month/day from the filename
+    and a 4-digit year from the source path. If no year can be established, fail
+    rather than silently exporting into the wrong year.
     """
-    try:
-        time_width = float(table.col_width(0))
-    except Exception:
-        time_width = 64.0
+    for sheet in doc.sheets:
+        for table in sheet.tables:
+            for r, row in enumerate(table.rows()):
+                for c in range(len(row)):
+                    cell = table.cell(r, c)
+                    if not isinstance(cell, numbers_parser.cell.DateCell):
+                        continue
 
-    widths = []
+                    value = getattr(cell, "value", None)
+                    if isinstance(value, datetime):
+                        return value.date()
+                    if isinstance(value, date):
+                        return value
 
-    # Sample actual physical content columns. The user's diary template normally
-    # uses equal B/C/D/... widths and creates wider areas by merging cells.
-    try:
-        source_rows = table.rows()
-        max_cols = max((len(row) for row in source_rows), default=0)
-    except Exception:
-        max_cols = 0
+    stem = Path(numbers_file).stem
+    month_pattern = "|".join(_MONTH_NAMES)
+    match = re.search(
+        rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?\b",
+        stem,
+        flags=re.IGNORECASE,
+    )
 
-    for c in range(1, max_cols):
-        try:
-            width = float(table.col_width(c))
-            if width > 0:
-                widths.append(width)
-        except Exception:
-            pass
+    if not match:
+        raise ValueError(
+            "Could not determine diary month/day from Numbers content or filename: "
+            f"{Path(numbers_file).name}"
+        )
 
-    basic_width = statistics.median(widths) if widths else 120.0
+    month_name = match.group(1).capitalize()
+    month = _MONTH_NAMES.index(month_name) + 1
+    day = int(match.group(2))
+
+    year = None
+    for part in reversed(Path(numbers_file).parts):
+        year_match = re.fullmatch(r"(19|20)\d{2}", part)
+        if year_match:
+            year = int(part)
+            break
+
+    if year is None:
+        raise ValueError(
+            "The Numbers file has no usable DateCell and its path does not contain "
+            "a 4-digit year. V1 will not guess the diary year."
+        )
+
+    return date(year, month, day)
+
+
+def _build_output_paths(output_root, diary_date):
+    output_root = Path(output_root).expanduser().resolve()
+    month_name = _MONTH_NAMES[diary_date.month - 1]
+    day_name = f"{month_name} {diary_date.day}"
+
+    data_day_folder = output_root / str(diary_date.year) / month_name / day_name
+    inspection_day_folder = (
+        output_root / "_inspection" / str(diary_date.year) / month_name / day_name
+    )
 
     return {
-        "time_column_width": time_width,
-        "basic_column_width": basic_width,
+        "output_root": output_root,
+        "month_name": month_name,
+        "day_name": day_name,
+        "data_day_folder": data_day_folder,
+        "inspection_day_folder": inspection_day_folder,
+        "csv": data_day_folder / f"{day_name}.csv",
+        "properties_csv": data_day_folder / f"{day_name}.properties.csv",
+        "img_folder": data_day_folder / IMG_FOLDER_NAME,
+        "inspection_json": inspection_day_folder / "properties.inspection.json",
+        "viewer_log": inspection_day_folder / "viewer-server.log",
+        "viewer_config": inspection_day_folder / "viewer-config.json",
     }
 
 
@@ -503,24 +565,53 @@ def _table_layout_constants(table):
 # Canonical export
 # ----------------------------------------------------------------------
 
-def parse_numbers_file(numbers_file, output_root):
+def _numbers_row_height(table, row_index):
+    try:
+        return float(table.row_height(row_index))
+    except Exception:
+        return None
+
+
+def _explicit_row_height(table, row_index):
     """
-    Canonical output:
+    numbers-parser returns 20.0 for the diary template's normal/default row
+    height. Numbers.app then auto-fits those rows to wrapped text when it
+    renders them. A stored height different from 20.0 is treated as an
+    explicit/manual row height and is preserved in the canonical properties.
+    """
+    height = _numbers_row_height(table, row_index)
+    if height is None:
+        return None
 
-        <day>.csv
-        <day>.properties.csv
-        IMG/
+    if abs(height - NUMBERS_DEFAULT_ROW_HEIGHT) < 1e-9:
+        return None
 
-    One Numbers diary row -> one CSV record.
+    return height
 
-    Rules:
-    - merged continuation cells are skipped
-    - a merged anchor becomes ONE logical CSV item with property span=N
-    - an ordinary empty physical cell between two content items is preserved:
-          data CSV        -> empty field
-          properties CSV  -> type=empty;span=1
-    - trailing unused physical cells are omitted
-    - shorter records are padded only at the END to make rectangular CSV
+
+def parse_numbers_file(numbers_file, output_root, show_inspection=True):
+    """
+    V1: parse ONE Numbers diary file.
+
+    Canonical persistent data:
+        Diary Export/<year>/<Month>/<Month day>/
+            <Month day>.csv
+            <Month day>.properties.csv
+            IMG/
+
+    Transient inspection/debug data (only when show_inspection=True):
+        Diary Export/_inspection/<year>/<Month>/<Month day>/
+            properties.inspection.json
+            viewer-server.log
+            viewer-config.json
+
+    Row-height rule:
+      - Numbers row_height == 20.0: do NOT store it. The viewer lets wrapped
+        text auto-fit and determine the rendered row height.
+      - Numbers row_height != 20.0: store row_height=<raw Numbers value> in the
+        first logical property's cell for that row. The viewer uses it as an
+        explicit minimum row height after applying the same horizontal scale
+        used for the fixed 98-unit diary content column.
     """
     numbers_file = Path(numbers_file).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
@@ -531,40 +622,51 @@ def parse_numbers_file(numbers_file, output_root):
     if numbers_file.suffix.lower() != ".numbers":
         raise ValueError(f"Expected a .numbers file: {numbers_file}")
 
-    output_day_folder = output_root / numbers_file.stem
-    img_dir = output_day_folder / IMG_FOLDER_NAME
-    data_csv_path = output_day_folder / f"{numbers_file.stem}.csv"
-    properties_csv_path = output_day_folder / f"{numbers_file.stem}.properties.csv"
-    inspection_json_path = output_day_folder / f"{numbers_file.stem}.inspection.json"
-
-    output_day_folder.mkdir(parents=True, exist_ok=True)
-    img_dir.mkdir(parents=True, exist_ok=True)
-
     doc = Document(str(numbers_file))
+    diary_date = _find_diary_date(doc, numbers_file)
+    paths = _build_output_paths(output_root, diary_date)
+
+    paths["data_day_folder"].mkdir(parents=True, exist_ok=True)
+
+    if paths["img_folder"].exists():
+        shutil.rmtree(paths["img_folder"])
+    paths["img_folder"].mkdir(parents=True, exist_ok=True)
+
+    if show_inspection:
+        paths["inspection_day_folder"].mkdir(parents=True, exist_ok=True)
+        # Clean up obsolete dual-viewer artifacts from earlier V1 iterations.
+        for stale_name in ("direct.inspection.json",):
+            stale = paths["inspection_day_folder"] / stale_name
+            try:
+                stale.unlink()
+            except FileNotFoundError:
+                pass
 
     data_rows = []
     property_rows = []
-
-    # Inspection-only: preserve original row numbering / blank source rows,
-    # plus only the two template width constants. This does NOT enter canonical
-    # data or properties.
     inspection_source_rows = []
-    layout_constants = None
 
-    for sheet in doc.sheets:
-        for table in sheet.tables:
-            if layout_constants is None:
-                layout_constants = _table_layout_constants(table)
-
+    for sheet_index, sheet in enumerate(doc.sheets):
+        for table_index, table in enumerate(sheet.tables):
             source_rows = table.rows()
 
             for source_row_index, row in enumerate(source_rows):
+                prepared = {}
                 meaningful_cols = []
 
                 for source_col_index in range(len(row)):
                     cell = table.cell(source_row_index, source_col_index)
 
-                    if _cell_has_meaningful_content(cell):
+                    if isinstance(cell, numbers_parser.cell.MergedCell):
+                        continue
+
+                    data_value, props = _logical_item_from_cell(
+                        cell,
+                        img_dir=paths["img_folder"],
+                    )
+                    prepared[source_col_index] = (data_value, props)
+
+                    if props.get("type") != "empty":
                         meaningful_cols.append(source_col_index)
 
                 if not meaningful_cols:
@@ -577,21 +679,23 @@ def parse_numbers_file(numbers_file, output_root):
                     continue
 
                 last_meaningful_col = max(meaningful_cols)
+                explicit_row_height = _explicit_row_height(table, source_row_index)
 
                 data_row = []
                 property_row = []
+                row_height_written = False
 
                 for source_col_index in range(last_meaningful_col + 1):
-                    cell = table.cell(source_row_index, source_col_index)
-
-                    # A continuation part of B:C:D merge is NOT a logical item.
-                    if isinstance(cell, numbers_parser.cell.MergedCell):
+                    if source_col_index not in prepared:
+                        # Merged continuation: no logical canonical CSV field.
                         continue
 
-                    data_value, props = _logical_item_from_cell(
-                        cell,
-                        img_dir=img_dir,
-                    )
+                    data_value, props = prepared[source_col_index]
+                    props = dict(props)
+
+                    if explicit_row_height is not None and not row_height_written:
+                        props["row_height"] = explicit_row_height
+                        row_height_written = True
 
                     data_row.append(data_value)
                     property_row.append(_serialize_properties(props))
@@ -599,7 +703,6 @@ def parse_numbers_file(numbers_file, output_root):
                 record_index = len(data_rows)
                 data_rows.append(data_row)
                 property_rows.append(property_row)
-
                 inspection_source_rows.append(
                     {
                         "numbers_row": source_row_index + 1,
@@ -608,40 +711,41 @@ def parse_numbers_file(numbers_file, output_root):
                 )
 
     max_items = max((len(row) for row in data_rows), default=0)
+    data_rows = [row + [""] * (max_items - len(row)) for row in data_rows]
+    property_rows = [row + [""] * (max_items - len(row)) for row in property_rows]
 
-    data_rows = [
-        row + [""] * (max_items - len(row))
-        for row in data_rows
-    ]
-    property_rows = [
-        row + [""] * (max_items - len(row))
-        for row in property_rows
-    ]
-
-    with data_csv_path.open("w", newline="", encoding=CSV_ENCODING) as fp:
+    with paths["csv"].open("w", newline="", encoding=CSV_ENCODING) as fp:
         csv.writer(fp).writerows(data_rows)
 
-    with properties_csv_path.open("w", newline="", encoding=CSV_ENCODING) as fp:
+    with paths["properties_csv"].open("w", newline="", encoding=CSV_ENCODING) as fp:
         csv.writer(fp).writerows(property_rows)
 
-    build_inspection_json(
-        data_csv_path=data_csv_path,
-        properties_csv_path=properties_csv_path,
-        inspection_json_path=inspection_json_path,
-        inspection_source_rows=inspection_source_rows,
-        layout_constants=layout_constants or {
-            "time_column_width": 64.0,
-            "basic_column_width": 120.0,
-        },
-    )
+    if show_inspection:
+        build_inspection_json(
+            data_csv_path=paths["csv"],
+            properties_csv_path=paths["properties_csv"],
+            inspection_json_path=paths["inspection_json"],
+            inspection_source_rows=inspection_source_rows,
+            layout_constants={
+                "time_column_width": PROPERTY_TIME_COLUMN_WIDTH,
+                "basic_column_width": PROPERTY_BASIC_COLUMN_WIDTH,
+                "source_basic_column_width": NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
+            },
+        )
 
     return {
         "source": str(numbers_file),
-        "output_folder": str(output_day_folder),
-        "csv": str(data_csv_path),
-        "properties_csv": str(properties_csv_path),
-        "img_folder": str(img_dir),
-        "inspection_json": str(inspection_json_path),
+        "date": diary_date.isoformat(),
+        "output_root": str(output_root),
+        "output_folder": str(paths["data_day_folder"]),
+        "csv": str(paths["csv"]),
+        "properties_csv": str(paths["properties_csv"]),
+        "img_folder": str(paths["img_folder"]),
+        "show_inspection": bool(show_inspection),
+        "inspection_folder": str(paths["inspection_day_folder"]),
+        "inspection_json": str(paths["inspection_json"]) if show_inspection else None,
+        "viewer_log": str(paths["viewer_log"]),
+        "viewer_config": str(paths["viewer_config"]),
     }
 
 
@@ -668,16 +772,7 @@ def build_inspection_json(
     inspection_source_rows,
     layout_constants,
 ):
-    """
-    Viewer data is reconstructed from canonical data+properties.
-
-    The ONLY extra inspection-only source information is:
-      - original Numbers row numbering / blank rows
-      - time-column width
-      - basic content-column width
-
-    No row heights or per-cell widths are copied from Numbers.
-    """
+    """Reconstruct viewer data from the canonical data CSV + properties CSV."""
     data_csv_path = Path(data_csv_path)
     properties_csv_path = Path(properties_csv_path)
     inspection_json_path = Path(inspection_json_path)
@@ -689,28 +784,20 @@ def build_inspection_json(
         property_rows = list(csv.reader(fp))
 
     if len(data_rows) != len(property_rows):
-        raise ValueError(
-            "Data CSV and properties CSV do not have the same row count."
-        )
+        raise ValueError("Data CSV and properties CSV do not have the same row count.")
 
     records = []
-    max_physical_columns = 1  # A = time column.
+    max_physical_columns = 1
 
-    for record_index, (data_row, prop_row) in enumerate(
-        zip(data_rows, property_rows)
-    ):
+    for record_index, (data_row, prop_row) in enumerate(zip(data_rows, property_rows)):
         if len(data_row) != len(prop_row):
-            raise ValueError(
-                f"CSV shape mismatch at record row {record_index + 1}."
-            )
+            raise ValueError(f"CSV shape mismatch at record row {record_index + 1}.")
 
         cells = []
         physical_col = 0
+        explicit_row_height = None
 
-        for logical_index, (value, prop_text) in enumerate(
-            zip(data_row, prop_row)
-        ):
-            # Trailing rectangular padding.
+        for logical_index, (value, prop_text) in enumerate(zip(data_row, prop_row)):
             if value == "" and prop_text == "":
                 continue
 
@@ -718,15 +805,18 @@ def build_inspection_json(
             item_type = props.get("type", "text")
             span = max(1, int(_property_number(props, "span", 1, int)))
 
+            if explicit_row_height is None:
+                explicit_row_height = _property_number(
+                    props,
+                    "row_height",
+                    None,
+                    float,
+                )
+
             style = {
                 "background": props.get("background"),
                 "font_color": props.get("font_color"),
-                "font_size": _property_number(
-                    props,
-                    "font_size",
-                    None,
-                    float,
-                ),
+                "font_size": _property_number(props, "font_size", None, float),
                 "font_name": props.get("font_name"),
                 "bold": props.get("bold") == "1",
                 "italic": props.get("italic") == "1",
@@ -736,14 +826,11 @@ def build_inspection_json(
 
             links = []
             i = 1
-
             while True:
                 text_key = f"link{i}_text"
                 url_key = f"link{i}_url"
-
                 if text_key not in props and url_key not in props:
                     break
-
                 links.append(
                     {
                         "text": props.get(text_key, ""),
@@ -752,32 +839,27 @@ def build_inspection_json(
                 )
                 i += 1
 
-            cell = {
-                "logical_index": logical_index,
-                "type": item_type,
-                "value": value,
-                "span": span,
-                "physical_col": physical_col,
-                "style": style,
-                "links": links,
-                "image_file": (
-                    value
-                    if item_type == "image"
-                    else props.get("image_file")
-                ),
-            }
-
-            cells.append(cell)
+            cells.append(
+                {
+                    "logical_index": logical_index,
+                    "type": item_type,
+                    "value": value,
+                    "span": span,
+                    "physical_col": physical_col,
+                    "style": style,
+                    "links": links,
+                    "image_file": (
+                        value if item_type == "image" else props.get("image_file")
+                    ),
+                }
+            )
             physical_col += span
 
-        max_physical_columns = max(
-            max_physical_columns,
-            physical_col,
-        )
-
+        max_physical_columns = max(max_physical_columns, physical_col)
         records.append(
             {
                 "record_index": record_index,
+                "row_height": explicit_row_height,
                 "cells": cells,
             }
         )
@@ -785,12 +867,9 @@ def build_inspection_json(
     payload = {
         "data_csv": data_csv_path.name,
         "properties_csv": properties_csv_path.name,
-        "time_column_width": float(
-            layout_constants["time_column_width"]
-        ),
-        "basic_column_width": float(
-            layout_constants["basic_column_width"]
-        ),
+        "time_column_width": float(layout_constants["time_column_width"]),
+        "basic_column_width": float(layout_constants["basic_column_width"]),
+        "source_basic_column_width": float(layout_constants["source_basic_column_width"]),
         "max_physical_columns": max_physical_columns,
         "source_rows": inspection_source_rows,
         "records": records,
@@ -800,7 +879,6 @@ def build_inspection_json(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-
     return inspection_json_path
 
 
@@ -963,10 +1041,14 @@ def _stop_stale_viewer(viewer_app, viewer_port, pid_file):
         pass
 
 
+def _viewer_pid_file(viewer_port):
+    return Path(tempfile.gettempdir()) / f"numbers_diary_viewer_{int(viewer_port)}.pid"
+
+
 def stop_numbers_viewer(viewer_port=8766):
     module_root = Path(__file__).resolve().parent
     viewer_app = module_root / "viewer" / "app.py"
-    pid_file = module_root / "viewer" / ".numbers_diary_viewer.pid"
+    pid_file = _viewer_pid_file(viewer_port)
 
     _stop_stale_viewer(
         viewer_app=viewer_app,
@@ -978,30 +1060,36 @@ def stop_numbers_viewer(viewer_port=8766):
 
 
 def display_numbers_export(result, viewer_port=8766):
+    """Start the inspection server and open the single Properties viewer."""
     global viewer_process, viewer_log_handle
 
+    if not result.get("show_inspection"):
+        print("SHOW_INSPECTION is False; canonical data was exported without viewer files.")
+        return None
+
     output_folder = Path(result["output_folder"]).expanduser().resolve()
-    inspection_json_path = Path(result["inspection_json"]).expanduser().resolve()
+    inspection_json = Path(result["inspection_json"]).expanduser().resolve()
+    viewer_log = Path(result["viewer_log"]).expanduser().resolve()
+    viewer_config = Path(result["viewer_config"]).expanduser().resolve()
 
     module_root = Path(__file__).resolve().parent
     viewer_app = module_root / "viewer" / "app.py"
-    viewer_log = output_folder / "viewer-server.log"
-    viewer_config = output_folder / "_viewer_config.json"
-    pid_file = module_root / "viewer" / ".numbers_diary_viewer.pid"
+    pid_file = _viewer_pid_file(viewer_port)
 
     if not viewer_app.is_file():
         raise FileNotFoundError(f"Viewer app was not found:\n{viewer_app}")
+    if not inspection_json.is_file():
+        raise FileNotFoundError(f"Inspection JSON was not found:\n{inspection_json}")
 
     if importlib.util.find_spec("flask") is None:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "Flask"]
-        )
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "Flask"])
 
+    viewer_config.parent.mkdir(parents=True, exist_ok=True)
     viewer_config.write_text(
         json.dumps(
             {
                 "output_folder": str(output_folder),
-                "inspection_json": str(inspection_json_path),
+                "inspection_json": str(inspection_json),
             },
             ensure_ascii=False,
             indent=2,
@@ -1016,7 +1104,6 @@ def display_numbers_export(result, viewer_port=8766):
     )
 
     viewer_log_handle = open(viewer_log, "a", encoding="utf-8")
-
     viewer_process = subprocess.Popen(
         [
             sys.executable,
@@ -1036,36 +1123,32 @@ def display_numbers_export(result, viewer_port=8766):
         start_new_session=True,
     )
 
-    local_url = f"http://127.0.0.1:{int(viewer_port)}/"
+    base_url = f"http://127.0.0.1:{int(viewer_port)}"
     deadline = time.monotonic() + 12
 
     while time.monotonic() < deadline:
-        if _viewer_ready(local_url):
+        if _viewer_ready(base_url):
             break
-
         if viewer_process.poll() is not None:
             break
-
         time.sleep(0.25)
 
-    if not _viewer_ready(local_url):
+    if not _viewer_ready(base_url):
         return_code = viewer_process.poll()
         _close_log_handle()
-
         raise RuntimeError(
             "Numbers Diary Viewer did not start.\n"
             f"Process return code: {return_code}\n"
             f"Read the server log:\n{viewer_log}"
         )
 
-    print(f"Numbers Diary Viewer: {local_url}")
+    url = f"{base_url}/?opened={time.time_ns()}"
+    print(f"Numbers Diary inspection: {url}")
     print(f"Viewer server log: {viewer_log}")
 
-    browser_url = f"{local_url}?opened={time.time_ns()}"
-    opened = webbrowser.open_new_tab(browser_url)
-
+    opened = webbrowser.open_new_tab(url)
     if not opened:
-        print("Browser did not open automatically. Open this URL:")
-        print(local_url)
+        print("If the browser tab did not open automatically, use the URL above.")
 
-    return local_url
+    return url
+

@@ -50,6 +50,14 @@
                 targetHeight = basicWidth;
             }
 
+            // Explicit/manual Numbers row heights are preserved in the canonical
+            // properties CSV. Auto/default rows (20.0 in Numbers) do not carry
+            // this attribute and remain purely text-driven.
+            const explicitHeight = px(row.dataset.explicitRowHeight);
+            if (explicitHeight > 0) {
+                targetHeight = Math.max(targetHeight, explicitHeight);
+            }
+
             const timeValue = row.querySelector(".time-value");
             if (timeValue) {
                 targetHeight = Math.max(targetHeight, timeValue.scrollHeight + 8);
