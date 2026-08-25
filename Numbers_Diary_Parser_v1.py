@@ -541,13 +541,21 @@ def _build_output_paths(output_root, diary_date):
     month_name = _MONTH_NAMES[diary_date.month - 1]
     day_name = f"{month_name} {diary_date.day}"
 
-    data_day_folder = output_root / str(diary_date.year) / month_name / day_name
+    # Canonical exported data and transient inspection data are siblings.
+    data_root = output_root / "data"
+    inspection_root = output_root / "_inspection"
+
+    data_day_folder = (
+        data_root / str(diary_date.year) / month_name / day_name
+    )
     inspection_day_folder = (
-        output_root / "_inspection" / str(diary_date.year) / month_name / day_name
+        inspection_root / str(diary_date.year) / month_name / day_name
     )
 
     return {
         "output_root": output_root,
+        "data_root": data_root,
+        "inspection_root": inspection_root,
         "month_name": month_name,
         "day_name": day_name,
         "data_day_folder": data_day_folder,
@@ -555,9 +563,14 @@ def _build_output_paths(output_root, diary_date):
         "csv": data_day_folder / f"{day_name}.csv",
         "properties_csv": data_day_folder / f"{day_name}.properties.csv",
         "img_folder": data_day_folder / IMG_FOLDER_NAME,
+
+        # Per-day derived inspection artifact.
         "inspection_json": inspection_day_folder / "properties.inspection.json",
-        "viewer_log": inspection_day_folder / "viewer-server.log",
-        "viewer_config": inspection_day_folder / "viewer-config.json",
+
+        # Viewer runtime state belongs to the inspection subsystem itself,
+        # not to any specific diary day.
+        "viewer_log": inspection_root / "viewer-server.log",
+        "viewer_config": inspection_root / "viewer-config.json",
     }
 
 
@@ -594,16 +607,24 @@ def parse_numbers_file(numbers_file, output_root, show_inspection=True):
     V1: parse ONE Numbers diary file.
 
     Canonical persistent data:
-        Diary Export/<year>/<Month>/<Month day>/
+        Diary Export/data/<year>/<Month>/<Month day>/
             <Month day>.csv
             <Month day>.properties.csv
             IMG/
 
-    Transient inspection/debug data (only when show_inspection=True):
+    Derived per-day inspection data:
         Diary Export/_inspection/<year>/<Month>/<Month day>/
             properties.inspection.json
-            viewer-server.log
+
+    Viewer runtime state:
+        Diary Export/_inspection/
             viewer-config.json
+            viewer-server.log
+
+    The per-day inspection JSON is generated together with every successful
+    parse. show_inspection only controls whether this parse result is intended
+    to be opened by display_numbers_export(); it does not suppress generation
+    of the derived inspection JSON.
 
     Row-height rule:
       - Numbers row_height == 20.0: do NOT store it. The viewer lets wrapped
@@ -632,15 +653,17 @@ def parse_numbers_file(numbers_file, output_root, show_inspection=True):
         shutil.rmtree(paths["img_folder"])
     paths["img_folder"].mkdir(parents=True, exist_ok=True)
 
-    if show_inspection:
-        paths["inspection_day_folder"].mkdir(parents=True, exist_ok=True)
-        # Clean up obsolete dual-viewer artifacts from earlier V1 iterations.
-        for stale_name in ("direct.inspection.json",):
-            stale = paths["inspection_day_folder"] / stale_name
-            try:
-                stale.unlink()
-            except FileNotFoundError:
-                pass
+    # Derived inspection data is generated for every successful parse.
+    # Opening the browser remains a separate notebook/UI decision.
+    paths["inspection_day_folder"].mkdir(parents=True, exist_ok=True)
+
+    # Clean up obsolete dual-viewer artifacts from earlier V1 iterations.
+    for stale_name in ("direct.inspection.json",):
+        stale = paths["inspection_day_folder"] / stale_name
+        try:
+            stale.unlink()
+        except FileNotFoundError:
+            pass
 
     data_rows = []
     property_rows = []
@@ -720,18 +743,17 @@ def parse_numbers_file(numbers_file, output_root, show_inspection=True):
     with paths["properties_csv"].open("w", newline="", encoding=CSV_ENCODING) as fp:
         csv.writer(fp).writerows(property_rows)
 
-    if show_inspection:
-        build_inspection_json(
-            data_csv_path=paths["csv"],
-            properties_csv_path=paths["properties_csv"],
-            inspection_json_path=paths["inspection_json"],
-            inspection_source_rows=inspection_source_rows,
-            layout_constants={
-                "time_column_width": PROPERTY_TIME_COLUMN_WIDTH,
-                "basic_column_width": PROPERTY_BASIC_COLUMN_WIDTH,
-                "source_basic_column_width": NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
-            },
-        )
+    build_inspection_json(
+        data_csv_path=paths["csv"],
+        properties_csv_path=paths["properties_csv"],
+        inspection_json_path=paths["inspection_json"],
+        inspection_source_rows=inspection_source_rows,
+        layout_constants={
+            "time_column_width": PROPERTY_TIME_COLUMN_WIDTH,
+            "basic_column_width": PROPERTY_BASIC_COLUMN_WIDTH,
+            "source_basic_column_width": NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
+        },
+    )
 
     return {
         "source": str(numbers_file),
@@ -742,8 +764,10 @@ def parse_numbers_file(numbers_file, output_root, show_inspection=True):
         "properties_csv": str(paths["properties_csv"]),
         "img_folder": str(paths["img_folder"]),
         "show_inspection": bool(show_inspection),
+        "data_root": str(paths["data_root"]),
+        "inspection_root": str(paths["inspection_root"]),
         "inspection_folder": str(paths["inspection_day_folder"]),
-        "inspection_json": str(paths["inspection_json"]) if show_inspection else None,
+        "inspection_json": str(paths["inspection_json"]),
         "viewer_log": str(paths["viewer_log"]),
         "viewer_config": str(paths["viewer_config"]),
     }
@@ -1064,7 +1088,7 @@ def display_numbers_export(result, viewer_port=8766):
     global viewer_process, viewer_log_handle
 
     if not result.get("show_inspection"):
-        print("SHOW_INSPECTION is False; canonical data was exported without viewer files.")
+        print("SHOW_INSPECTION is False; data and derived inspection JSON were exported, but the viewer was not opened.")
         return None
 
     output_folder = Path(result["output_folder"]).expanduser().resolve()
@@ -1103,7 +1127,7 @@ def display_numbers_export(result, viewer_port=8766):
         pid_file=pid_file,
     )
 
-    viewer_log_handle = open(viewer_log, "a", encoding="utf-8")
+    viewer_log_handle = open(viewer_log, "w", encoding="utf-8")
     viewer_process = subprocess.Popen(
         [
             sys.executable,
