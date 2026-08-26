@@ -1,32 +1,13 @@
 from __future__ import annotations
 
-import argparse
-import atexit
-import json
+from html import escape
 import os
 from pathlib import Path
-
-from flask import Flask, abort, render_template, send_from_directory
+from urllib.parse import quote
 
 
 APP_ROOT = Path(__file__).resolve().parent
-
-app = Flask(
-    __name__,
-    template_folder=str(APP_ROOT / "templates"),
-    static_folder=str(APP_ROOT / "static"),
-)
-
-CONFIG = None
-
 NUMBERS_SOURCE_BASIC_COLUMN_WIDTH = 98.0
-
-
-def load_config(config_path):
-    payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
-    payload["output_folder"] = Path(payload["output_folder"]).expanduser().resolve()
-    payload["inspection_json"] = Path(payload["inspection_json"]).expanduser().resolve()
-    return payload
 
 
 def column_name(index_zero_based):
@@ -38,9 +19,6 @@ def column_name(index_zero_based):
         result = chr(65 + remainder) + result
 
     return result
-
-
-app.jinja_env.globals["column_name"] = column_name
 
 
 def css_text_style(style):
@@ -159,134 +137,212 @@ def split_text_into_link_segments(text, links):
     return segments
 
 
-@app.route("/")
-def index():
-    payload = json.loads(
-        CONFIG["inspection_json"].read_text(encoding="utf-8")
+def _image_src(html_path, output_folder, image_file):
+    image_path = Path(output_folder) / "IMG" / str(image_file)
+    relative = os.path.relpath(image_path, start=Path(html_path).parent)
+    return quote(Path(relative).as_posix(), safe="/._-~")
+
+
+def _text_html(text, links):
+    pieces = []
+
+    for segment in split_text_into_link_segments(str(text or ""), links or []):
+        segment_text = escape(str(segment["text"]))
+        url = segment.get("url")
+
+        if url:
+            pieces.append(
+                '<a class="rich-link" href="{}" target="_blank" rel="noopener">{}</a>'.format(
+                    escape(str(url), quote=True),
+                    segment_text,
+                )
+            )
+        else:
+            pieces.append(segment_text)
+
+    return "".join(pieces)
+
+
+def _render_table(payload, output_folder, html_path):
+    time_width = float(payload.get("time_column_width", 64.0))
+    basic_width = float(payload.get("basic_column_width", 120.0))
+    source_basic_width = float(
+        payload.get("source_basic_column_width", NUMBERS_SOURCE_BASIC_COLUMN_WIDTH)
     )
+    max_physical_columns = int(payload.get("max_physical_columns", 1))
 
     records = {
         int(record["record_index"]): record
         for record in payload.get("records", [])
     }
 
-    rows = []
+    out = []
+    out.append(
+        '<table style="--time-width: {}px; --basic-width: {}px;">'.format(
+            time_width,
+            basic_width,
+        )
+    )
+    out.append("<colgroup>")
+    out.append('<col class="row-number-column">')
+    out.append('<col class="time-column">')
+    for _ in range(1, max_physical_columns):
+        out.append('<col class="basic-column">')
+    out.append("</colgroup>")
+
+    out.append("<thead><tr>")
+    out.append('<th class="corner"></th>')
+    for col_index in range(max_physical_columns):
+        out.append(
+            '<th class="column-header">{}</th>'.format(
+                escape(column_name(col_index))
+            )
+        )
+    out.append("</tr></thead>")
+    out.append("<tbody>")
 
     for source_row in payload.get("source_rows", []):
+        numbers_row = int(source_row["numbers_row"])
         record_index = source_row.get("record_index")
 
         if record_index is None:
-            rows.append(
-                {
-                    "numbers_row": int(source_row["numbers_row"]),
-                    "cells": [],
-                }
-            )
+            out.append('<tr class="diary-row">')
+            out.append(f'<th class="row-header">{numbers_row}</th>')
+            for _ in range(max_physical_columns):
+                out.append('<td class="blank-cell"></td>')
+            out.append("</tr>")
             continue
 
         record = records[int(record_index)]
-        cells = []
-
         explicit_row_height = record.get("row_height")
         display_row_height = None
+
         if explicit_row_height is not None:
             try:
-                basic_width = float(payload.get("basic_column_width", 120.0))
-                source_basic_width = float(
-                    payload.get(
-                        "source_basic_column_width",
-                        NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
-                    )
-                )
                 display_row_height = (
                     float(explicit_row_height) * basic_width / source_basic_width
                 )
             except Exception:
                 display_row_height = None
 
-        for cell in record.get("cells", []):
-            item_type = cell.get("type", "text")
-            value = cell.get("value", "")
-            links = cell.get("links") or []
-
-            cells.append(
-                {
-                    "type": item_type,
-                    "value": value,
-                    "span": int(cell.get("span", 1)),
-                    "style": css_text_style(cell.get("style") or {}),
-                    "segments": (
-                        split_text_into_link_segments(value, links)
-                        if item_type in ("text", "text_image")
-                        else []
-                    ),
-                    "image_file": cell.get("image_file"),
-                }
+        if display_row_height is None:
+            out.append('<tr class="diary-row">')
+        else:
+            out.append(
+                '<tr class="diary-row" data-explicit-row-height="{}">'.format(
+                    display_row_height
+                )
             )
 
-        rows.append(
-            {
-                "numbers_row": int(source_row["numbers_row"]),
-                "cells": cells,
-                "display_row_height": display_row_height,
-            }
-        )
+        out.append(f'<th class="row-header">{numbers_row}</th>')
 
-    return render_template(
-        "viewer.html",
-        title=payload.get("data_csv", "Numbers Diary Inspection"),
-        time_width=float(payload.get("time_column_width", 64.0)),
-        basic_width=float(payload.get("basic_column_width", 120.0)),
-        max_physical_columns=int(payload.get("max_physical_columns", 1)),
-        rows=rows,
+        cells = record.get("cells", [])
+        used_columns = 0
+
+        for cell in cells:
+            item_type = cell.get("type", "text")
+            value = cell.get("value", "")
+            span = max(1, int(cell.get("span", 1)))
+            used_columns += span
+
+            classes = ["diary-cell"]
+            if item_type == "datetime":
+                classes.append("time-cell")
+            if item_type == "empty":
+                classes.append("empty-cell")
+            if item_type == "image":
+                classes.append("image-cell")
+
+            attrs = [
+                f'colspan="{span}"',
+                'class="{}"'.format(" ".join(classes)),
+            ]
+
+            if item_type in ("text", "text_image"):
+                attrs.append(
+                    'style="{}"'.format(
+                        escape(css_text_style(cell.get("style") or {}), quote=True)
+                    )
+                )
+
+            out.append("<td {}>".format(" ".join(attrs)))
+
+            if item_type == "datetime":
+                out.append(
+                    '<div class="time-value">{}</div>'.format(
+                        escape(str(value or ""))
+                    )
+                )
+
+            elif item_type in ("text", "text_image"):
+                out.append(
+                    '<div class="text-value">{}</div>'.format(
+                        _text_html(value, cell.get("links") or [])
+                    )
+                )
+
+                image_file = cell.get("image_file")
+                if item_type == "text_image" and image_file:
+                    out.append(
+                        '<div class="image-fit"><img src="{}" loading="lazy"></div>'.format(
+                            escape(
+                                _image_src(html_path, output_folder, image_file),
+                                quote=True,
+                            )
+                        )
+                    )
+
+            elif item_type == "image" and cell.get("image_file"):
+                out.append(
+                    '<div class="image-fit"><img src="{}" loading="lazy"></div>'.format(
+                        escape(
+                            _image_src(
+                                html_path,
+                                output_folder,
+                                cell["image_file"],
+                            ),
+                            quote=True,
+                        )
+                    )
+                )
+
+            out.append("</td>")
+
+        for _ in range(used_columns, max_physical_columns):
+            out.append('<td class="blank-cell"></td>')
+
+        out.append("</tr>")
+
+    out.append("</tbody></table>")
+    return "\n".join(out)
+
+
+def render_standalone_html(payload, output_folder, html_path):
+    """
+    Render one inspection page that can be opened directly from Finder.
+
+    CSS, JavaScript and table data are embedded into the HTML. Images stay in
+    the canonical data/IMG folder and are referenced with relative file paths.
+    No Flask server, JSON sidecar, config file or log file is required.
+    """
+    html_path = Path(html_path).expanduser().resolve()
+    output_folder = Path(output_folder).expanduser().resolve()
+
+    template = (APP_ROOT / "templates" / "viewer.html").read_text(encoding="utf-8")
+    css = (APP_ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    javascript = (APP_ROOT / "static" / "viewer.js").read_text(encoding="utf-8")
+
+    title = str(payload.get("data_csv") or "Numbers Diary Inspection")
+    table_html = _render_table(payload, output_folder, html_path)
+
+    rendered = (
+        template
+        .replace("__TITLE__", escape(title))
+        .replace("__INLINE_CSS__", css)
+        .replace("__TABLE_HTML__", table_html)
+        .replace("__INLINE_JS__", javascript)
     )
 
-
-@app.route("/file/<path:relative_path>")
-def exported_file(relative_path):
-    output_root = CONFIG["output_folder"].resolve()
-    candidate = (output_root / relative_path).resolve()
-
-    if candidate != output_root and output_root not in candidate.parents:
-        abort(404)
-
-    return send_from_directory(str(output_root), relative_path)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", required=True)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8766)
-    parser.add_argument("--pid-file")
-    return parser.parse_args()
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    CONFIG = load_config(args.config)
-
-    pid_file = Path(args.pid_file).resolve() if args.pid_file else None
-
-    if pid_file is not None:
-        pid_file.parent.mkdir(parents=True, exist_ok=True)
-        pid_file.write_text(str(os.getpid()), encoding="utf-8")
-
-        def remove_pid_file():
-            try:
-                if pid_file.is_file():
-                    recorded = pid_file.read_text(encoding="utf-8").strip()
-
-                    if recorded == str(os.getpid()):
-                        pid_file.unlink()
-            except Exception:
-                pass
-
-        atexit.register(remove_pid_file)
-
-    app.run(
-        host=args.host,
-        port=args.port,
-        debug=False,
-        use_reloader=False,
-    )
+    html_path.parent.mkdir(parents=True, exist_ok=True)
+    html_path.write_text(rendered, encoding="utf-8")
+    return html_path

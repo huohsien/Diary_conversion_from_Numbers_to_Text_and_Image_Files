@@ -1,25 +1,84 @@
 # Diary conversion from Numbers to Text and Image Files
 
-V1 parses one Apple Numbers diary file at a time and exports portable canonical
-CSV data plus images. V2 will later traverse an entire year folder.
+This project converts Apple Numbers diary files into portable canonical CSV +
+image data and generates one static HTML page per day for human visual
+inspection.
 
-## Canonical output
+## Design rule: module = details, notebook = visible workflow
+
+`Numbers_Diary_Parser_v1.py` contains the detailed reusable operations, most
+importantly `parse_numbers_file()`, which still parses exactly one Numbers diary
+file.  The notebook deliberately owns the high-level orchestration: the visible
+loops over hand-picked year folders, calendar-month folders, and individual
+`.numbers` files.
+
+That separation keeps the already-tested single-file parser reusable while
+making batch processing readable and easy to stop or inspect at checkpoints.
+
+## Source hierarchy
+
+The current hand-picked 2026 source folder is:
+
+```text
+/Users/huohsien/Library/Mobile Documents/com~apple~Numbers/Documents/2026 Diary/
+├── January/
+├── February/
+├── March/
+├── April/
+├── May/
+├── June/
+├── July/
+└── August/
+```
+
+The notebook does not invent this path.  `SOURCE_YEAR_FOLDERS` contains the
+explicit folders chosen by the user.  More years can later be added as more
+`Path(...)` entries.
+
+`list_month_folders(year_folder)` only handles the filesystem detail of finding
+existing month folders and returning them in January-to-December order.
+`list_numbers_files(month_folder)` handles file discovery inside one month.
+The actual loops remain visible in the notebook.
+
+There is no need to calculate February 28/29 or month lengths: only files that
+actually exist are visited.  The diary DateCell inside each Numbers file still
+determines the canonical output date.
+
+## Output hierarchy
 
 ```text
 ~/Downloads/Diary Export/
-└── 2026/
-    └── May/
-        └── May 25/
-            ├── May 25.csv
-            ├── May 25.properties.csv
-            └── IMG/
+├── data/
+│   └── 2026/
+│       └── May/
+│           └── May 25/
+│               ├── May 25.csv
+│               ├── May 25.properties.csv
+│               └── IMG/
+│
+└── _inspection/
+    └── 2026/
+        └── May/
+            └── May 25/
+                └── May 25.html
 ```
 
-`<day>.csv` contains logical diary values: time, text, intentional empty fields,
-and image filenames. `<day>.properties.csv` has the same row/column shape and
-stores the matching properties.
+`data/` is canonical persistent export data. `_inspection/` is derived human
+inspection output. Every successfully parsed day gets one directly-openable
+HTML page. There is no inspection JSON, Flask server, viewer config, viewer log,
+port, or `SHOW_INSPECTION` flag.
 
-Canonical rules:
+The HTML embeds viewer CSS, JavaScript, and reconstructed cell data. Images stay
+in the canonical `data/.../IMG/` folder and are referenced through relative
+paths.
+
+## Canonical dual CSV
+
+`<day>.csv` contains logical diary values: time, text, intentional empty fields,
+and image filenames. `<day>.properties.csv` has the same logical shape and
+stores matching properties.
+
+Canonical rules include:
 
 - merged continuation cells are skipped;
 - horizontal merge is stored as `span=N`;
@@ -29,56 +88,34 @@ Canonical rules:
   underline, strike, and hyperlink metadata;
 - rich-text dictionaries are normalized to visible text;
 - images are stored in `IMG/` and referenced by bare filename;
-- the diary template uses a fixed time column plus equal-width content columns;
-- `numbers-parser` reports `row_height=20.0` for normal/default rows. That value
-  is not stored because Numbers auto-fits those rows to wrapped text;
-- a row height different from 20.0 is treated as an explicit/manual row height
-  and stored once as `row_height=<value>` in that row's first properties field.
+- `row_height=20.0` is treated as the normal/default auto-fit state and is not
+  stored;
+- a Numbers row height different from `20.0` is preserved once as an explicit
+  `row_height=<value>` property.
 
-## Inspection
+## Inspection layout
 
-When `SHOW_INSPECTION = True`:
+The static HTML is reconstructed from the canonical dual CSV, not from a Direct
+representation.
 
-```text
-~/Downloads/Diary Export/
-└── _inspection/
-    └── 2026/
-        └── May/
-            └── May 25/
-                ├── properties.inspection.json
-                ├── viewer-server.log
-                └── viewer-config.json
-```
+1. Normal rows are text-driven and browser wrapping determines their height.
+2. Explicit/manual rows use the preserved Numbers row height as a minimum after
+   the same layout scaling used for content-column width.
+3. Images preserve aspect ratio and contain inside the final row box.
+4. Image-only rows fall back to one basic-column square unless an explicit row
+   height is present.
 
-There is one inspection viewer only:
+## Notebook checkpoints
 
-```text
-<day>.csv + <day>.properties.csv
-        ↓
-properties.inspection.json
-        ↓
-viewer.html
-```
+The notebook is intentionally readable as workflow rather than as a function
+library:
 
-Row layout rule:
+1. import/reload the parser module;
+2. explicitly choose `SOURCE_YEAR_FOLDERS` and `OUTPUT_ROOT`;
+3. preview each year/month and the number of `.numbers` files before writing;
+4. visibly loop year -> month -> file and call `parse_numbers_file()` once per
+   file;
+5. print successes and errors at the end.
 
-1. Normal rows (`row_height` absent) are text-driven. The browser wraps text at
-   the width implied by `span` and lets that text determine the row height.
-2. Explicit/manual rows use the stored Numbers height as a minimum height,
-   scaled by the same ratio used for the fixed content-column width.
-3. Images never determine the height of a row that contains text. They keep
-   their aspect ratio and `contain` inside the final row box. This preserves the
-   diary behavior where a tall screenshot may appear narrow in an ordinary row,
-   while a manually enlarged row gives a tall screenshot more display area.
-4. Image-only rows fall back to one basic-column square height unless an
-   explicit/manual row height is present.
-
-## V1 notebook
-
-```python
-TEST_NUMBERS_FILE = Path("/Users/huohsien/Desktop/May 25 copy.numbers")
-OUTPUT_ROOT = Path("/Users/huohsien/Downloads/Diary Export")
-SHOW_INSPECTION = True
-```
-
-Set `SHOW_INSPECTION = False` for canonical export only.
+One unusual file can be recorded as an error while the remaining files continue
+when `CONTINUE_ON_ERROR = True`.

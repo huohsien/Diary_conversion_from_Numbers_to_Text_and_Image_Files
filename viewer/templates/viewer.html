@@ -3,113 +3,23 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{{ title }}</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <title>__TITLE__</title>
+    <style>
+__INLINE_CSS__
+    </style>
 </head>
 <body>
     <header class="toolbar">
-        <div class="title">{{ title }}</div>
+        <div class="title">__TITLE__</div>
         <div class="summary">Visual integrity / completeness inspection</div>
     </header>
 
     <main class="viewer">
-        <table
-            style="
-                --time-width: {{ time_width }}px;
-                --basic-width: {{ basic_width }}px;
-            "
-        >
-            <colgroup>
-                <col class="row-number-column">
-                <col class="time-column">
-
-                {% for col_index in range(1, max_physical_columns) %}
-                    <col class="basic-column">
-                {% endfor %}
-            </colgroup>
-
-            <thead>
-                <tr>
-                    <th class="corner"></th>
-
-                    {% for col_index in range(max_physical_columns) %}
-                        <th class="column-header">
-                            {{ column_name(col_index) }}
-                        </th>
-                    {% endfor %}
-                </tr>
-            </thead>
-
-            <tbody>
-                {% for row in rows %}
-                <tr
-                    class="diary-row"
-                    {% if row.display_row_height %}
-                        data-explicit-row-height="{{ row.display_row_height }}"
-                    {% endif %}
-                >
-                    <th class="row-header">
-                        {{ row.numbers_row }}
-                    </th>
-
-                    {% if not row.cells %}
-                        {% for col_index in range(max_physical_columns) %}
-                            <td class="blank-cell"></td>
-                        {% endfor %}
-                    {% else %}
-                        {% for cell in row.cells %}
-                            <td
-                                colspan="{{ cell.span }}"
-                                class="
-                                    diary-cell
-                                    {% if cell.type == 'datetime' %}time-cell{% endif %}
-                                    {% if cell.type == 'empty' %}empty-cell{% endif %}
-                                    {% if cell.type == 'image' %}image-cell{% endif %}
-                                "
-                                {% if cell.type in ('text', 'text_image') %}
-                                    style="{{ cell.style }}"
-                                {% endif %}
-                            >
-                                {% if cell.type == "datetime" %}
-                                    <div class="time-value">{{ cell.value }}</div>
-
-                                {% elif cell.type == "text" or cell.type == "text_image" %}
-                                    <div class="text-value">{%- for segment in cell.segments -%}{%- if segment.url -%}<a class="rich-link" href="{{ segment.url }}" target="_blank">{{ segment.text }}</a>{%- else -%}{{ segment.text }}{%- endif -%}{%- endfor -%}</div>
-
-                                    {% if cell.type == "text_image" and cell.image_file %}
-                                        <div class="image-fit">
-                                            <img
-                                                src="{{ url_for('exported_file', relative_path='IMG/' + cell.image_file) }}"
-                                                loading="lazy"
-                                            >
-                                        </div>
-                                    {% endif %}
-
-                                {% elif cell.type == "image" and cell.image_file %}
-                                    <div class="image-fit">
-                                        <img
-                                            src="{{ url_for('exported_file', relative_path='IMG/' + cell.image_file) }}"
-                                            loading="lazy"
-                                        >
-                                    </div>
-                                {% endif %}
-                            </td>
-                        {% endfor %}
-
-                        {% set used = namespace(total=0) %}
-                        {% for cell in row.cells %}
-                            {% set used.total = used.total + cell.span %}
-                        {% endfor %}
-
-                        {% for col_index in range(used.total, max_physical_columns) %}
-                            <td class="blank-cell"></td>
-                        {% endfor %}
-                    {% endif %}
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+__TABLE_HTML__
     </main>
-    <script src="{{ url_for('static', filename='viewer.js') }}"></script>
+
+    <script>
+__INLINE_JS__
+    </script>
 </body>
 </html>

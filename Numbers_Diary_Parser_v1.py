@@ -4,30 +4,19 @@ from pathlib import Path
 from datetime import date, datetime
 import ast
 import csv
-import importlib.util
-import json
-import os
 import re
-import signal
 import shutil
-import subprocess
-import sys
-import tempfile
-import time
-import webbrowser
-from urllib.error import URLError
 from urllib.parse import quote, unquote
-from urllib.request import urlopen
 
 import numbers_parser
 from numbers_parser import Document
+
+from viewer.app import render_standalone_html
 
 
 IMG_FOLDER_NAME = "IMG"
 CSV_ENCODING = "utf-8-sig"
 
-viewer_process = None
-viewer_log_handle = None
 
 # Property-driven viewer uses the fixed diary-template display widths from the
 # verified dual-CSV viewer. Canonical row heights are stored only when the
@@ -541,13 +530,10 @@ def _build_output_paths(output_root, diary_date):
     month_name = _MONTH_NAMES[diary_date.month - 1]
     day_name = f"{month_name} {diary_date.day}"
 
-    # Canonical exported data and transient inspection data are siblings.
     data_root = output_root / "data"
     inspection_root = output_root / "_inspection"
 
-    data_day_folder = (
-        data_root / str(diary_date.year) / month_name / day_name
-    )
+    data_day_folder = data_root / str(diary_date.year) / month_name / day_name
     inspection_day_folder = (
         inspection_root / str(diary_date.year) / month_name / day_name
     )
@@ -563,14 +549,7 @@ def _build_output_paths(output_root, diary_date):
         "csv": data_day_folder / f"{day_name}.csv",
         "properties_csv": data_day_folder / f"{day_name}.properties.csv",
         "img_folder": data_day_folder / IMG_FOLDER_NAME,
-
-        # Per-day derived inspection artifact.
-        "inspection_json": inspection_day_folder / "properties.inspection.json",
-
-        # Viewer runtime state belongs to the inspection subsystem itself,
-        # not to any specific diary day.
-        "viewer_log": inspection_root / "viewer-server.log",
-        "viewer_config": inspection_root / "viewer-config.json",
+        "inspection_html": inspection_day_folder / f"{day_name}.html",
     }
 
 
@@ -602,37 +581,27 @@ def _explicit_row_height(table, row_index):
     return height
 
 
-def parse_numbers_file(numbers_file, output_root, show_inspection=True):
+def parse_numbers_file(numbers_file, output_root):
     """
-    V1: parse ONE Numbers diary file.
+    Parse ONE Numbers diary file and always generate both canonical data and a
+    directly-openable inspection HTML page.
 
-    Canonical persistent data:
+    Canonical data:
         Diary Export/data/<year>/<Month>/<Month day>/
             <Month day>.csv
             <Month day>.properties.csv
             IMG/
 
-    Derived per-day inspection data:
+    Human visual inspection:
         Diary Export/_inspection/<year>/<Month>/<Month day>/
-            properties.inspection.json
-
-    Viewer runtime state:
-        Diary Export/_inspection/
-            viewer-config.json
-            viewer-server.log
-
-    The per-day inspection JSON is generated together with every successful
-    parse. show_inspection only controls whether this parse result is intended
-    to be opened by display_numbers_export(); it does not suppress generation
-    of the derived inspection JSON.
+            <Month day>.html
 
     Row-height rule:
-      - Numbers row_height == 20.0: do NOT store it. The viewer lets wrapped
-        text auto-fit and determine the rendered row height.
-      - Numbers row_height != 20.0: store row_height=<raw Numbers value> in the
-        first logical property's cell for that row. The viewer uses it as an
-        explicit minimum row height after applying the same horizontal scale
-        used for the fixed 98-unit diary content column.
+      - Numbers row_height == 20.0: do NOT store it. Wrapped text auto-fits and
+        determines the rendered inspection row height.
+      - Numbers row_height != 20.0: preserve row_height=<raw Numbers value> in
+        the first logical properties cell and use it as an explicit minimum
+        inspection height after applying the same 98->120 display scale.
     """
     numbers_file = Path(numbers_file).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
@@ -648,22 +617,11 @@ def parse_numbers_file(numbers_file, output_root, show_inspection=True):
     paths = _build_output_paths(output_root, diary_date)
 
     paths["data_day_folder"].mkdir(parents=True, exist_ok=True)
+    paths["inspection_day_folder"].mkdir(parents=True, exist_ok=True)
 
     if paths["img_folder"].exists():
         shutil.rmtree(paths["img_folder"])
     paths["img_folder"].mkdir(parents=True, exist_ok=True)
-
-    # Derived inspection data is generated for every successful parse.
-    # Opening the browser remains a separate notebook/UI decision.
-    paths["inspection_day_folder"].mkdir(parents=True, exist_ok=True)
-
-    # Clean up obsolete dual-viewer artifacts from earlier V1 iterations.
-    for stale_name in ("direct.inspection.json",):
-        stale = paths["inspection_day_folder"] / stale_name
-        try:
-            stale.unlink()
-        except FileNotFoundError:
-            pass
 
     data_rows = []
     property_rows = []
@@ -743,10 +701,11 @@ def parse_numbers_file(numbers_file, output_root, show_inspection=True):
     with paths["properties_csv"].open("w", newline="", encoding=CSV_ENCODING) as fp:
         csv.writer(fp).writerows(property_rows)
 
-    build_inspection_json(
+    build_inspection_html(
         data_csv_path=paths["csv"],
         properties_csv_path=paths["properties_csv"],
-        inspection_json_path=paths["inspection_json"],
+        inspection_html_path=paths["inspection_html"],
+        output_folder=paths["data_day_folder"],
         inspection_source_rows=inspection_source_rows,
         layout_constants={
             "time_column_width": PROPERTY_TIME_COLUMN_WIDTH,
@@ -759,22 +718,74 @@ def parse_numbers_file(numbers_file, output_root, show_inspection=True):
         "source": str(numbers_file),
         "date": diary_date.isoformat(),
         "output_root": str(output_root),
+        "data_root": str(paths["data_root"]),
+        "inspection_root": str(paths["inspection_root"]),
         "output_folder": str(paths["data_day_folder"]),
         "csv": str(paths["csv"]),
         "properties_csv": str(paths["properties_csv"]),
         "img_folder": str(paths["img_folder"]),
-        "show_inspection": bool(show_inspection),
-        "data_root": str(paths["data_root"]),
-        "inspection_root": str(paths["inspection_root"]),
         "inspection_folder": str(paths["inspection_day_folder"]),
-        "inspection_json": str(paths["inspection_json"]),
-        "viewer_log": str(paths["viewer_log"]),
-        "viewer_config": str(paths["viewer_config"]),
+        "inspection_html": str(paths["inspection_html"]),
     }
 
 
+
+def list_month_folders(year_folder):
+    """
+    Return existing calendar-month folders under ONE hand-picked year folder,
+    ordered January..December.
+
+    This helper only handles the filesystem detail. The notebook deliberately
+    owns the visible year -> month -> file control flow.
+    """
+    year_folder = Path(year_folder).expanduser().resolve()
+
+    if not year_folder.is_dir():
+        raise NotADirectoryError(f"Year folder not found: {year_folder}")
+
+    by_name = {
+        child.name.casefold(): child
+        for child in year_folder.iterdir()
+        if child.is_dir()
+    }
+
+    return [
+        by_name[month_name.casefold()]
+        for month_name in _MONTH_NAMES
+        if month_name.casefold() in by_name
+    ]
+
+
+def _natural_path_sort_key(path):
+    """Natural filename ordering such as May 2 before May 10."""
+    parts = re.split(r"(\d+)", Path(path).name.casefold())
+    return tuple(int(part) if part.isdigit() else part for part in parts)
+
+
+def list_numbers_files(month_folder):
+    """
+    Return .numbers files below ONE month folder in stable natural order.
+
+    Recursive discovery is intentional so the notebook does not need to know
+    whether an individual month stores day files directly or one level deeper.
+    """
+    month_folder = Path(month_folder).expanduser().resolve()
+
+    if not month_folder.is_dir():
+        raise NotADirectoryError(f"Month folder not found: {month_folder}")
+
+    files = [
+        path
+        for path in month_folder.rglob("*.numbers")
+        if not path.name.startswith("~$")
+    ]
+    return sorted(files, key=_natural_path_sort_key)
+
+
 # ----------------------------------------------------------------------
-# Derived inspection JSON
+# Derived inspection HTML
+# ----------------------------------------------------------------------
+# Derived inspection HTML
 # ----------------------------------------------------------------------
 
 def _property_number(props, key, default=None, cast=float):
@@ -789,17 +800,15 @@ def _property_number(props, key, default=None, cast=float):
         return default
 
 
-def build_inspection_json(
+def _build_inspection_payload(
     data_csv_path,
     properties_csv_path,
-    inspection_json_path,
     inspection_source_rows,
     layout_constants,
 ):
-    """Reconstruct viewer data from the canonical data CSV + properties CSV."""
+    """Reconstruct inspection data strictly from the canonical dual CSV."""
     data_csv_path = Path(data_csv_path)
     properties_csv_path = Path(properties_csv_path)
-    inspection_json_path = Path(inspection_json_path)
 
     with data_csv_path.open("r", encoding=CSV_ENCODING, newline="") as fp:
         data_rows = list(csv.reader(fp))
@@ -888,291 +897,45 @@ def build_inspection_json(
             }
         )
 
-    payload = {
+    return {
         "data_csv": data_csv_path.name,
         "properties_csv": properties_csv_path.name,
         "time_column_width": float(layout_constants["time_column_width"]),
         "basic_column_width": float(layout_constants["basic_column_width"]),
-        "source_basic_column_width": float(layout_constants["source_basic_column_width"]),
+        "source_basic_column_width": float(
+            layout_constants["source_basic_column_width"]
+        ),
         "max_physical_columns": max_physical_columns,
         "source_rows": inspection_source_rows,
         "records": records,
     }
 
-    inspection_json_path.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    return inspection_json_path
 
+def build_inspection_html(
+    data_csv_path,
+    properties_csv_path,
+    inspection_html_path,
+    output_folder,
+    inspection_source_rows,
+    layout_constants,
+):
+    """
+    Build a static inspection page directly from the canonical dual CSV.
 
-# ----------------------------------------------------------------------
-# Viewer lifecycle
-# ----------------------------------------------------------------------
-
-def _viewer_ready(url):
-    try:
-        with urlopen(url, timeout=0.5) as response:
-            return response.status < 500
-    except (URLError, TimeoutError, OSError):
-        return False
-
-
-def _pid_is_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-        return True
-    except (ProcessLookupError, ValueError, TypeError):
-        return False
-    except PermissionError:
-        return True
-
-
-def _terminate_pid(pid, timeout=5):
-    pid = int(pid)
-
-    if not _pid_is_alive(pid):
-        return False
-
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return False
-
-    deadline = time.monotonic() + timeout
-
-    while time.monotonic() < deadline:
-        if not _pid_is_alive(pid):
-            return True
-        time.sleep(0.1)
-
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
-
-    return True
-
-
-def _listener_pids_on_port(port):
-    completed = subprocess.run(
-        ["lsof", "-nP", f"-iTCP:{int(port)}", "-sTCP:LISTEN", "-t"],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
+    There is deliberately no JSON sidecar and no web server. The resulting HTML
+    can be double-clicked in Finder. It references images in data/.../IMG by
+    relative path, so the whole Diary Export hierarchy remains portable.
+    """
+    payload = _build_inspection_payload(
+        data_csv_path=data_csv_path,
+        properties_csv_path=properties_csv_path,
+        inspection_source_rows=inspection_source_rows,
+        layout_constants=layout_constants,
     )
 
-    return sorted(
-        {
-            int(line.strip())
-            for line in completed.stdout.splitlines()
-            if line.strip().isdigit()
-        }
+    return render_standalone_html(
+        payload=payload,
+        output_folder=output_folder,
+        html_path=inspection_html_path,
     )
-
-
-def _process_command(pid):
-    completed = subprocess.run(
-        ["ps", "-p", str(int(pid)), "-o", "command="],
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    return completed.stdout.strip()
-
-
-def _is_our_viewer_process(pid, viewer_app):
-    command = _process_command(pid)
-
-    if not command:
-        return False
-
-    return str(Path(viewer_app).resolve()) in command
-
-
-def _close_log_handle():
-    global viewer_log_handle
-
-    if viewer_log_handle is not None:
-        try:
-            viewer_log_handle.close()
-        except Exception:
-            pass
-
-    viewer_log_handle = None
-
-
-def _stop_in_memory_viewer():
-    global viewer_process
-
-    if viewer_process is not None and viewer_process.poll() is None:
-        viewer_process.terminate()
-
-        try:
-            viewer_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            viewer_process.kill()
-            viewer_process.wait(timeout=5)
-
-    viewer_process = None
-    _close_log_handle()
-
-
-def _stop_stale_viewer(viewer_app, viewer_port, pid_file):
-    _stop_in_memory_viewer()
-
-    candidate_pids = []
-
-    if pid_file.is_file():
-        try:
-            candidate_pids.append(
-                int(pid_file.read_text(encoding="utf-8").strip())
-            )
-        except Exception:
-            pass
-
-    for pid in _listener_pids_on_port(viewer_port):
-        if pid not in candidate_pids:
-            candidate_pids.append(pid)
-
-    for pid in candidate_pids:
-        if _pid_is_alive(pid) and _is_our_viewer_process(pid, viewer_app):
-            _terminate_pid(pid)
-
-    deadline = time.monotonic() + 5
-
-    while time.monotonic() < deadline:
-        listeners = _listener_pids_on_port(viewer_port)
-
-        if not listeners:
-            break
-
-        if all(
-            not _is_our_viewer_process(pid, viewer_app)
-            for pid in listeners
-        ):
-            raise RuntimeError(
-                f"Port {viewer_port} is used by another application."
-            )
-
-        time.sleep(0.1)
-
-    try:
-        pid_file.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def _viewer_pid_file(viewer_port):
-    return Path(tempfile.gettempdir()) / f"numbers_diary_viewer_{int(viewer_port)}.pid"
-
-
-def stop_numbers_viewer(viewer_port=8766):
-    module_root = Path(__file__).resolve().parent
-    viewer_app = module_root / "viewer" / "app.py"
-    pid_file = _viewer_pid_file(viewer_port)
-
-    _stop_stale_viewer(
-        viewer_app=viewer_app,
-        viewer_port=viewer_port,
-        pid_file=pid_file,
-    )
-
-    print("Numbers Diary Viewer is stopped.")
-
-
-def display_numbers_export(result, viewer_port=8766):
-    """Start the inspection server and open the single Properties viewer."""
-    global viewer_process, viewer_log_handle
-
-    if not result.get("show_inspection"):
-        print("SHOW_INSPECTION is False; data and derived inspection JSON were exported, but the viewer was not opened.")
-        return None
-
-    output_folder = Path(result["output_folder"]).expanduser().resolve()
-    inspection_json = Path(result["inspection_json"]).expanduser().resolve()
-    viewer_log = Path(result["viewer_log"]).expanduser().resolve()
-    viewer_config = Path(result["viewer_config"]).expanduser().resolve()
-
-    module_root = Path(__file__).resolve().parent
-    viewer_app = module_root / "viewer" / "app.py"
-    pid_file = _viewer_pid_file(viewer_port)
-
-    if not viewer_app.is_file():
-        raise FileNotFoundError(f"Viewer app was not found:\n{viewer_app}")
-    if not inspection_json.is_file():
-        raise FileNotFoundError(f"Inspection JSON was not found:\n{inspection_json}")
-
-    if importlib.util.find_spec("flask") is None:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "Flask"])
-
-    viewer_config.parent.mkdir(parents=True, exist_ok=True)
-    viewer_config.write_text(
-        json.dumps(
-            {
-                "output_folder": str(output_folder),
-                "inspection_json": str(inspection_json),
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    _stop_stale_viewer(
-        viewer_app=viewer_app,
-        viewer_port=viewer_port,
-        pid_file=pid_file,
-    )
-
-    viewer_log_handle = open(viewer_log, "w", encoding="utf-8")
-    viewer_process = subprocess.Popen(
-        [
-            sys.executable,
-            str(viewer_app),
-            "--config",
-            str(viewer_config),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(viewer_port),
-            "--pid-file",
-            str(pid_file),
-        ],
-        cwd=str(viewer_app.parent),
-        stdout=viewer_log_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-    )
-
-    base_url = f"http://127.0.0.1:{int(viewer_port)}"
-    deadline = time.monotonic() + 12
-
-    while time.monotonic() < deadline:
-        if _viewer_ready(base_url):
-            break
-        if viewer_process.poll() is not None:
-            break
-        time.sleep(0.25)
-
-    if not _viewer_ready(base_url):
-        return_code = viewer_process.poll()
-        _close_log_handle()
-        raise RuntimeError(
-            "Numbers Diary Viewer did not start.\n"
-            f"Process return code: {return_code}\n"
-            f"Read the server log:\n{viewer_log}"
-        )
-
-    url = f"{base_url}/?opened={time.time_ns()}"
-    print(f"Numbers Diary inspection: {url}")
-    print(f"Viewer server log: {viewer_log}")
-
-    opened = webbrowser.open_new_tab(url)
-    if not opened:
-        print("If the browser tab did not open automatically, use the URL above.")
-
-    return url
 
