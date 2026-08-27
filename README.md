@@ -119,3 +119,7 @@ library:
 
 One unusual file can be recorded as an error while the remaining files continue
 when `CONTINUE_ON_ERROR = True`.
+
+## Transactional single-day replacement
+
+`parse_numbers_file()` builds one complete day under `Diary Export/.staging/` first. Existing canonical data and inspection HTML are left untouched until CSV, properties CSV, images, and HTML have all been generated successfully. The staged data and inspection directories are then renamed into place with rollback backups, so an ordinary parse/build error does not corrupt a previous successful export.

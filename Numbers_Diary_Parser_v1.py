@@ -6,6 +6,8 @@ import ast
 import csv
 import re
 import shutil
+import tempfile
+import uuid
 from urllib.parse import quote, unquote
 
 import numbers_parser
@@ -554,6 +556,86 @@ def _build_output_paths(output_root, diary_date):
 
 
 # ----------------------------------------------------------------------
+# Transactional per-day output
+# ----------------------------------------------------------------------
+
+def _remove_path(path):
+    path = Path(path)
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def _commit_staged_day_outputs(staged_paths, final_paths):
+    """
+    Install one fully-built diary day without exposing a half-written result.
+
+    Both the canonical day directory and its inspection day directory are
+    constructed under OUTPUT_ROOT/.staging first.  Existing final directories
+    are renamed to temporary backups, the staged directories are renamed into
+    place, and backups are removed only after both installs succeed.
+
+    If an ordinary Python/filesystem exception occurs during the commit phase,
+    any newly installed directories are removed and the previous directories
+    are restored from their backups.
+    """
+    transaction_id = uuid.uuid4().hex
+    pairs = [
+        (
+            Path(staged_paths["data_day_folder"]),
+            Path(final_paths["data_day_folder"]),
+        ),
+        (
+            Path(staged_paths["inspection_day_folder"]),
+            Path(final_paths["inspection_day_folder"]),
+        ),
+    ]
+
+    backups = []
+    installed = []
+
+    try:
+        for _, final_dir in pairs:
+            final_dir.parent.mkdir(parents=True, exist_ok=True)
+
+        # Move the previous known-good version out of the way, but keep it
+        # available for rollback until BOTH staged directories are installed.
+        for _, final_dir in pairs:
+            backup_dir = final_dir.with_name(
+                f".{final_dir.name}.backup-{transaction_id}"
+            )
+            _remove_path(backup_dir)
+
+            if final_dir.exists():
+                final_dir.rename(backup_dir)
+                backups.append((final_dir, backup_dir))
+
+        # Staging lives under the same OUTPUT_ROOT, so these are same-filesystem
+        # directory renames rather than copy-and-delete operations.
+        for staged_dir, final_dir in pairs:
+            staged_dir.rename(final_dir)
+            installed.append(final_dir)
+
+    except Exception:
+        # Remove any partially installed new version.
+        for final_dir in reversed(installed):
+            _remove_path(final_dir)
+
+        # Restore every previous known-good version that was backed up.
+        for final_dir, backup_dir in reversed(backups):
+            if backup_dir.exists():
+                backup_dir.rename(final_dir)
+        raise
+
+    else:
+        for _, backup_dir in backups:
+            _remove_path(backup_dir)
+
+
+# ----------------------------------------------------------------------
 # Canonical export
 # ----------------------------------------------------------------------
 
@@ -583,8 +665,13 @@ def _explicit_row_height(table, row_index):
 
 def parse_numbers_file(numbers_file, output_root):
     """
-    Parse ONE Numbers diary file and always generate both canonical data and a
-    directly-openable inspection HTML page.
+    Parse ONE Numbers diary file transactionally.
+
+    Nothing in an existing final day output is modified while parsing.  The new
+    CSV, properties CSV, IMG folder, and static inspection HTML are first built
+    in a temporary OUTPUT_ROOT/.staging tree that mirrors the final hierarchy.
+    Only after every part succeeds are the staged data and inspection day
+    directories committed into their final locations.
 
     Canonical data:
         Diary Export/data/<year>/<Month>/<Month day>/
@@ -612,122 +699,165 @@ def parse_numbers_file(numbers_file, output_root):
     if numbers_file.suffix.lower() != ".numbers":
         raise ValueError(f"Expected a .numbers file: {numbers_file}")
 
+    # Opening the source and determining its diary date do not touch output.
     doc = Document(str(numbers_file))
     diary_date = _find_diary_date(doc, numbers_file)
-    paths = _build_output_paths(output_root, diary_date)
+    final_paths = _build_output_paths(output_root, diary_date)
 
-    paths["data_day_folder"].mkdir(parents=True, exist_ok=True)
-    paths["inspection_day_folder"].mkdir(parents=True, exist_ok=True)
+    staging_parent = output_root / ".staging"
+    staging_parent.mkdir(parents=True, exist_ok=True)
+    staging_root = Path(
+        tempfile.mkdtemp(
+            prefix=f"{diary_date.isoformat()}-",
+            dir=staging_parent,
+        )
+    )
+    staged_paths = _build_output_paths(staging_root, diary_date)
 
-    if paths["img_folder"].exists():
-        shutil.rmtree(paths["img_folder"])
-    paths["img_folder"].mkdir(parents=True, exist_ok=True)
+    try:
+        staged_paths["data_day_folder"].mkdir(parents=True, exist_ok=True)
+        staged_paths["inspection_day_folder"].mkdir(parents=True, exist_ok=True)
+        staged_paths["img_folder"].mkdir(parents=True, exist_ok=True)
 
-    data_rows = []
-    property_rows = []
-    inspection_source_rows = []
+        data_rows = []
+        property_rows = []
+        inspection_source_rows = []
 
-    for sheet_index, sheet in enumerate(doc.sheets):
-        for table_index, table in enumerate(sheet.tables):
-            source_rows = table.rows()
+        for sheet_index, sheet in enumerate(doc.sheets):
+            for table_index, table in enumerate(sheet.tables):
+                source_rows = table.rows()
 
-            for source_row_index, row in enumerate(source_rows):
-                prepared = {}
-                meaningful_cols = []
+                for source_row_index, row in enumerate(source_rows):
+                    prepared = {}
+                    meaningful_cols = []
 
-                for source_col_index in range(len(row)):
-                    cell = table.cell(source_row_index, source_col_index)
+                    for source_col_index in range(len(row)):
+                        cell = table.cell(source_row_index, source_col_index)
 
-                    if isinstance(cell, numbers_parser.cell.MergedCell):
+                        if isinstance(cell, numbers_parser.cell.MergedCell):
+                            continue
+
+                        data_value, props = _logical_item_from_cell(
+                            cell,
+                            img_dir=staged_paths["img_folder"],
+                        )
+                        prepared[source_col_index] = (data_value, props)
+
+                        if props.get("type") != "empty":
+                            meaningful_cols.append(source_col_index)
+
+                    if not meaningful_cols:
+                        inspection_source_rows.append(
+                            {
+                                "numbers_row": source_row_index + 1,
+                                "record_index": None,
+                            }
+                        )
                         continue
 
-                    data_value, props = _logical_item_from_cell(
-                        cell,
-                        img_dir=paths["img_folder"],
+                    last_meaningful_col = max(meaningful_cols)
+                    explicit_row_height = _explicit_row_height(
+                        table,
+                        source_row_index,
                     )
-                    prepared[source_col_index] = (data_value, props)
 
-                    if props.get("type") != "empty":
-                        meaningful_cols.append(source_col_index)
+                    data_row = []
+                    property_row = []
+                    row_height_written = False
 
-                if not meaningful_cols:
+                    for source_col_index in range(last_meaningful_col + 1):
+                        if source_col_index not in prepared:
+                            # Merged continuation: no logical canonical CSV field.
+                            continue
+
+                        data_value, props = prepared[source_col_index]
+                        props = dict(props)
+
+                        if (
+                            explicit_row_height is not None
+                            and not row_height_written
+                        ):
+                            props["row_height"] = explicit_row_height
+                            row_height_written = True
+
+                        data_row.append(data_value)
+                        property_row.append(_serialize_properties(props))
+
+                    record_index = len(data_rows)
+                    data_rows.append(data_row)
+                    property_rows.append(property_row)
                     inspection_source_rows.append(
                         {
                             "numbers_row": source_row_index + 1,
-                            "record_index": None,
+                            "record_index": record_index,
                         }
                     )
-                    continue
 
-                last_meaningful_col = max(meaningful_cols)
-                explicit_row_height = _explicit_row_height(table, source_row_index)
+        max_items = max((len(row) for row in data_rows), default=0)
+        data_rows = [
+            row + [""] * (max_items - len(row))
+            for row in data_rows
+        ]
+        property_rows = [
+            row + [""] * (max_items - len(row))
+            for row in property_rows
+        ]
 
-                data_row = []
-                property_row = []
-                row_height_written = False
+        with staged_paths["csv"].open(
+            "w",
+            newline="",
+            encoding=CSV_ENCODING,
+        ) as fp:
+            csv.writer(fp).writerows(data_rows)
 
-                for source_col_index in range(last_meaningful_col + 1):
-                    if source_col_index not in prepared:
-                        # Merged continuation: no logical canonical CSV field.
-                        continue
+        with staged_paths["properties_csv"].open(
+            "w",
+            newline="",
+            encoding=CSV_ENCODING,
+        ) as fp:
+            csv.writer(fp).writerows(property_rows)
 
-                    data_value, props = prepared[source_col_index]
-                    props = dict(props)
+        build_inspection_html(
+            data_csv_path=staged_paths["csv"],
+            properties_csv_path=staged_paths["properties_csv"],
+            inspection_html_path=staged_paths["inspection_html"],
+            output_folder=staged_paths["data_day_folder"],
+            inspection_source_rows=inspection_source_rows,
+            layout_constants={
+                "time_column_width": PROPERTY_TIME_COLUMN_WIDTH,
+                "basic_column_width": PROPERTY_BASIC_COLUMN_WIDTH,
+                "source_basic_column_width": NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
+            },
+        )
 
-                    if explicit_row_height is not None and not row_height_written:
-                        props["row_height"] = explicit_row_height
-                        row_height_written = True
+        # This is the only point at which the existing final day can change.
+        _commit_staged_day_outputs(staged_paths, final_paths)
 
-                    data_row.append(data_value)
-                    property_row.append(_serialize_properties(props))
-
-                record_index = len(data_rows)
-                data_rows.append(data_row)
-                property_rows.append(property_row)
-                inspection_source_rows.append(
-                    {
-                        "numbers_row": source_row_index + 1,
-                        "record_index": record_index,
-                    }
-                )
-
-    max_items = max((len(row) for row in data_rows), default=0)
-    data_rows = [row + [""] * (max_items - len(row)) for row in data_rows]
-    property_rows = [row + [""] * (max_items - len(row)) for row in property_rows]
-
-    with paths["csv"].open("w", newline="", encoding=CSV_ENCODING) as fp:
-        csv.writer(fp).writerows(data_rows)
-
-    with paths["properties_csv"].open("w", newline="", encoding=CSV_ENCODING) as fp:
-        csv.writer(fp).writerows(property_rows)
-
-    build_inspection_html(
-        data_csv_path=paths["csv"],
-        properties_csv_path=paths["properties_csv"],
-        inspection_html_path=paths["inspection_html"],
-        output_folder=paths["data_day_folder"],
-        inspection_source_rows=inspection_source_rows,
-        layout_constants={
-            "time_column_width": PROPERTY_TIME_COLUMN_WIDTH,
-            "basic_column_width": PROPERTY_BASIC_COLUMN_WIDTH,
-            "source_basic_column_width": NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
-        },
-    )
+    finally:
+        # On parse/build failure, this only removes unfinished staging data.
+        # On success, the two staged day directories have already been renamed
+        # into final locations, so this removes the now-empty staging tree.
+        _remove_path(staging_root)
+        try:
+            staging_parent.rmdir()
+        except OSError:
+            # Other concurrent/failed staging transactions may still exist.
+            pass
 
     return {
         "source": str(numbers_file),
         "date": diary_date.isoformat(),
         "output_root": str(output_root),
-        "data_root": str(paths["data_root"]),
-        "inspection_root": str(paths["inspection_root"]),
-        "output_folder": str(paths["data_day_folder"]),
-        "csv": str(paths["csv"]),
-        "properties_csv": str(paths["properties_csv"]),
-        "img_folder": str(paths["img_folder"]),
-        "inspection_folder": str(paths["inspection_day_folder"]),
-        "inspection_html": str(paths["inspection_html"]),
+        "data_root": str(final_paths["data_root"]),
+        "inspection_root": str(final_paths["inspection_root"]),
+        "output_folder": str(final_paths["data_day_folder"]),
+        "csv": str(final_paths["csv"]),
+        "properties_csv": str(final_paths["properties_csv"]),
+        "img_folder": str(final_paths["img_folder"]),
+        "inspection_folder": str(final_paths["inspection_day_folder"]),
+        "inspection_html": str(final_paths["inspection_html"]),
+        "transactional": True,
     }
-
 
 
 def list_month_folders(year_folder):
