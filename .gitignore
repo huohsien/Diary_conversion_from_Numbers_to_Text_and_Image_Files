@@ -1,2 +1,6 @@
+# Python runtime artifacts
 __pycache__/
-viewer/.numbers_diary_viewer.pid
+*.py[cod]
+
+# Per-run parser logs are intentionally local runtime records.
+logs/*.log

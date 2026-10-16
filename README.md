@@ -44,6 +44,53 @@ There is no need to calculate February 28/29 or month lengths: only files that
 actually exist are visited.  The diary DateCell inside each Numbers file still
 determines the canonical output date.
 
+## Runtime used for the current parser
+
+The current working environment uses Python 3.12 and `numbers-parser` 4.19.0.
+The older Python 3.8 / `numbers-parser` 4.4.2 environment failed while opening
+`July 27.numbers` and `July 29.numbers` inside `numbers_parser.Document(...)`;
+4.19.0 successfully opens and parses July 27.
+
+
+## Run modes and dry run
+
+The Notebook has one visible `RUN_MODE` switch:
+
+- `RUN_MODE = "dry_run"` opens every discovered `.numbers` file, resolves its
+  diary date, walks every sheet/table/row/cell, and exercises text, style,
+  hyperlink, merge/span, background-image, and row-height reads. It writes no
+  CSV, images, inspection HTML, staging directory, or `Diary Export` data.
+- `RUN_MODE = "parse"` performs the real transactional export.
+
+For a small real-output test, set `ONLY_FILE_NAMES` in the Notebook, for example
+`{"July 27.numbers", "July 29.numbers"}`. The visible year/month loops remain
+the same, but only those filenames are processed.
+
+This keeps the high-level decision visible in the Notebook while the detailed
+read/parse operations remain in `Numbers_Diary_Parser_v1.py`.
+
+## Verbose run logging
+
+Every Notebook run creates a timestamped verbose log under the Git project:
+
+```text
+<project>/logs/
+└── diary-parser-YYYYMMDD-HHMMSS-<mode>.log
+```
+
+Logs live with the project rather than under `Diary Export`, because
+`Diary Export` is derived output that may be deleted and regenerated. The log
+therefore survives a clean re-export. The file log records DEBUG and above,
+including runtime versions, source discovery, document opening, date
+resolution/fallbacks, sheet/table/row progress, images, special styled cells,
+row-height handling, CSV/HTML generation, staging, transactional commit/rollback,
+full exception tracebacks, per-file elapsed time, and whole-run elapsed time.
+The Notebook console remains much quieter; WARNING and ERROR messages are also
+shown there.
+
+`logs/*.log`, `__pycache__/`, and `*.pyc` are ignored by Git. `logs/.gitkeep`
+only keeps the intentional logs directory in the repository.
+
 ## Output hierarchy
 
 ```text
@@ -83,6 +130,7 @@ Canonical rules include:
 - merged continuation cells are skipped;
 - horizontal merge is stored as `span=N`;
 - intentional empty cells between meaningful items are preserved;
+- visually styled empty cells (for example an empty gray cell) preserve their background instead of collapsing into ordinary white blanks;
 - trailing unused physical cells are omitted;
 - text properties preserve background, font color/name/size, bold, italic,
   underline, strike, and hyperlink metadata;
@@ -104,6 +152,8 @@ representation.
 3. Images preserve aspect ratio and contain inside the final row box.
 4. Image-only rows fall back to one basic-column square unless an explicit row
    height is present.
+5. Time cells remain horizontally centered but are vertically top-aligned, matching Numbers.
+6. Background-only empty cells retain their exported background in the inspection HTML.
 
 ## Notebook checkpoints
 
@@ -113,9 +163,9 @@ library:
 1. import/reload the parser module;
 2. explicitly choose `SOURCE_YEAR_FOLDERS` and `OUTPUT_ROOT`;
 3. preview each year/month and the number of `.numbers` files before writing;
-4. visibly loop year -> month -> file and call `parse_numbers_file()` once per
-   file;
-5. print successes and errors at the end.
+4. visibly loop year -> month -> file and call `dry_run_numbers_file()` or
+   `parse_numbers_file()` according to `RUN_MODE`;
+5. print successes, errors, total elapsed time, and the run-log path at the end.
 
 One unusual file can be recorded as an error while the remaining files continue
 when `CONTINUE_ON_ERROR = True`.

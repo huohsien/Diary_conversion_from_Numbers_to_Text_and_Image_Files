@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from html import escape
+import logging
 import os
 from pathlib import Path
 from urllib.parse import quote
@@ -8,6 +9,7 @@ from urllib.parse import quote
 
 APP_ROOT = Path(__file__).resolve().parent
 NUMBERS_SOURCE_BASIC_COLUMN_WIDTH = 98.0
+LOGGER = logging.getLogger("numbers_diary_parser.viewer")
 
 
 def column_name(index_zero_based):
@@ -164,6 +166,11 @@ def _text_html(text, links):
 
 
 def _render_table(payload, output_folder, html_path):
+    LOGGER.debug(
+        "VIEWER render table records=%d source_rows=%d",
+        len(payload.get("records", [])),
+        len(payload.get("source_rows", [])),
+    )
     time_width = float(payload.get("time_column_width", 64.0))
     basic_width = float(payload.get("basic_column_width", 120.0))
     source_basic_width = float(
@@ -258,10 +265,18 @@ def _render_table(payload, output_folder, html_path):
                 'class="{}"'.format(" ".join(classes)),
             ]
 
+            cell_style = cell.get("style") or {}
+
             if item_type in ("text", "text_image"):
                 attrs.append(
                     'style="{}"'.format(
-                        escape(css_text_style(cell.get("style") or {}), quote=True)
+                        escape(css_text_style(cell_style), quote=True)
+                    )
+                )
+            elif cell_style.get("background"):
+                attrs.append(
+                    'style="background:{}"'.format(
+                        escape(str(cell_style["background"]), quote=True)
                     )
                 )
 
@@ -327,6 +342,7 @@ def render_standalone_html(payload, output_folder, html_path):
     """
     html_path = Path(html_path).expanduser().resolve()
     output_folder = Path(output_folder).expanduser().resolve()
+    LOGGER.debug("VIEWER standalone HTML begin path=%s", html_path)
 
     template = (APP_ROOT / "templates" / "viewer.html").read_text(encoding="utf-8")
     css = (APP_ROOT / "static" / "style.css").read_text(encoding="utf-8")
@@ -345,4 +361,5 @@ def render_standalone_html(payload, output_folder, html_path):
 
     html_path.parent.mkdir(parents=True, exist_ok=True)
     html_path.write_text(rendered, encoding="utf-8")
+    LOGGER.debug("VIEWER standalone HTML complete path=%s bytes=%d", html_path, len(rendered.encode("utf-8")))
     return html_path

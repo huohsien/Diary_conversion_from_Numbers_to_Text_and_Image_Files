@@ -4,10 +4,14 @@ from pathlib import Path
 from datetime import date, datetime
 import ast
 import csv
+import logging
 import re
 import shutil
+import sys
 import tempfile
 import uuid
+from importlib.metadata import PackageNotFoundError, version as package_version
+from time import perf_counter
 from urllib.parse import quote, unquote
 
 import numbers_parser
@@ -18,6 +22,90 @@ from viewer.app import render_standalone_html
 
 IMG_FOLDER_NAME = "IMG"
 CSV_ENCODING = "utf-8-sig"
+PROJECT_ROOT = Path(__file__).resolve().parent
+LOGGER = logging.getLogger("numbers_diary_parser")
+LOGGER.addHandler(logging.NullHandler())
+
+
+def _numbers_parser_version():
+    try:
+        return package_version("numbers-parser")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def _format_elapsed(seconds):
+    hours, remainder = divmod(float(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{int(hours):02d}:{int(minutes):02d}:{seconds:05.2f}"
+
+
+def configure_run_logging(run_mode, log_dir=None):
+    """
+    Configure one verbose log file for a Notebook run.
+
+    Logs belong to the project, not to Diary Export. Diary Export is derived
+    output and may be deleted/rebuilt; run logs should survive that operation.
+    The file handler records DEBUG and above. The console handler only emits
+    WARNING and ERROR so the Notebook's own progress output stays readable.
+    """
+    log_dir = Path(log_dir or (PROJECT_ROOT / "logs")).expanduser().resolve()
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe_mode = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_mode or "run"))
+    log_path = log_dir / f"diary-parser-{timestamp}-{safe_mode}.log"
+
+    # Re-running the Notebook setup cell must not multiply handlers.
+    for handler in list(LOGGER.handlers):
+        LOGGER.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+
+    LOGGER.setLevel(logging.DEBUG)
+    LOGGER.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    LOGGER.addHandler(file_handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)
+    console_handler.setFormatter(formatter)
+    LOGGER.addHandler(console_handler)
+
+    LOGGER.info("RUN START mode=%s", run_mode)
+    LOGGER.info("project_root=%s", PROJECT_ROOT)
+    LOGGER.info("log_path=%s", log_path)
+    LOGGER.info("python=%s", sys.version.replace("\n", " "))
+    LOGGER.info("python_executable=%s", sys.executable)
+    LOGGER.info("numbers-parser=%s", _numbers_parser_version())
+    return LOGGER, log_path
+
+
+def finish_run_logging(run_mode, started_at, results, errors):
+    elapsed = perf_counter() - started_at
+    LOGGER.info(
+        "RUN END mode=%s parsed_ok=%d failed=%d elapsed=%s",
+        run_mode,
+        len(results),
+        len(errors),
+        _format_elapsed(elapsed),
+    )
+    for handler in LOGGER.handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+    return elapsed
 
 
 # Property-driven viewer uses the fixed diary-template display widths from the
@@ -97,6 +185,7 @@ def _unique_destination_path(folder, filename):
     if not candidate.exists():
         return candidate
 
+    LOGGER.debug("IMAGE filename collision: %s", candidate)
     stem = candidate.stem
     suffix = candidate.suffix
     i = 2
@@ -119,7 +208,8 @@ def _rgb_to_hex(rgb):
     except Exception:
         try:
             r, g, b = [float(x) for x in rgb[:3]]
-        except Exception:
+        except Exception as exc:
+            LOGGER.debug("STYLE unable to convert color %r: %s", rgb, exc)
             return None
 
     if max(r, g, b) <= 1.0:
@@ -258,7 +348,8 @@ def _extract_visible_text_from_rich_value(value):
         if stripped.startswith("{") and "'text'" in stripped:
             try:
                 parsed = ast.literal_eval(stripped)
-            except (ValueError, SyntaxError):
+            except (ValueError, SyntaxError) as exc:
+                LOGGER.warning("RICH_TEXT unable to parse stringified metadata: %s", exc)
                 parsed = None
 
             if isinstance(parsed, dict) and parsed.get("text") is not None:
@@ -281,8 +372,8 @@ def _cell_value_as_text(cell):
     if isinstance(cell, numbers_parser.cell.DateCell):
         try:
             return value.strftime("%H:%M")
-        except Exception:
-            pass
+        except Exception as exc:
+            LOGGER.debug("DATE_CELL strftime failed; using fallback: %s", exc)
 
     # For text/rich-text, trust value first. In the user's parser build,
     # formatted_value can expose the whole rich-text metadata structure.
@@ -320,6 +411,11 @@ def _extract_background_image(cell, img_dir):
     original_filename = getattr(bg_image, "filename", None) or "image"
     destination = _unique_destination_path(img_dir, original_filename)
     destination.write_bytes(image_data)
+    LOGGER.debug(
+        "IMAGE wrote file=%s bytes=%d",
+        destination,
+        len(image_data),
+    )
 
     return destination.name
 
@@ -343,7 +439,8 @@ def _horizontal_span(cell):
     try:
         # numbers-parser merge size is (rows, columns).
         return max(1, int(size[1]))
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning("MERGE unable to read horizontal span; using span=1: %s", exc)
         return 1
 
 
@@ -415,6 +512,16 @@ def _logical_item_from_cell(cell, img_dir):
         # Background color is still useful for visual inspection if present.
         if style.get("background") is not None:
             props["background"] = style["background"]
+
+    elif item_type == "empty":
+        # A text-empty cell with a visible background is still canonical layout
+        # information and must not collapse into an ordinary white blank.
+        if style.get("background") is not None:
+            props["background"] = style["background"]
+            LOGGER.debug("CELL preserve styled empty background=%s", style["background"])
+
+    if hyperlinks:
+        LOGGER.debug("CELL hyperlinks=%d", len(hyperlinks))
 
     return data_value, props
 
@@ -489,8 +596,25 @@ def _find_diary_date(doc, numbers_file):
 
                     value = getattr(cell, "value", None)
                     if isinstance(value, datetime):
-                        return value.date()
+                        resolved = value.date()
+                        LOGGER.debug(
+                            "DATE resolved from DateCell sheet=%s table=%s row=%d col=%d date=%s",
+                            getattr(sheet, "name", "?"),
+                            getattr(table, "name", "?"),
+                            r + 1,
+                            c + 1,
+                            resolved,
+                        )
+                        return resolved
                     if isinstance(value, date):
+                        LOGGER.debug(
+                            "DATE resolved from DateCell sheet=%s table=%s row=%d col=%d date=%s",
+                            getattr(sheet, "name", "?"),
+                            getattr(table, "name", "?"),
+                            r + 1,
+                            c + 1,
+                            value,
+                        )
                         return value
 
     stem = Path(numbers_file).stem
@@ -502,6 +626,7 @@ def _find_diary_date(doc, numbers_file):
     )
 
     if not match:
+        LOGGER.error("DATE unresolved from content and filename: %s", numbers_file)
         raise ValueError(
             "Could not determine diary month/day from Numbers content or filename: "
             f"{Path(numbers_file).name}"
@@ -519,12 +644,19 @@ def _find_diary_date(doc, numbers_file):
             break
 
     if year is None:
+        LOGGER.error("DATE filename fallback found month/day but no year in path: %s", numbers_file)
         raise ValueError(
             "The Numbers file has no usable DateCell and its path does not contain "
             "a 4-digit year. V1 will not guess the diary year."
         )
 
-    return date(year, month, day)
+    resolved = date(year, month, day)
+    LOGGER.warning(
+        "DATE using filename/path fallback source=%s resolved=%s",
+        numbers_file,
+        resolved,
+    )
+    return resolved
 
 
 def _build_output_paths(output_root, diary_date):
@@ -563,6 +695,7 @@ def _remove_path(path):
     path = Path(path)
     if not path.exists():
         return
+    LOGGER.debug("REMOVE path=%s", path)
     if path.is_dir():
         shutil.rmtree(path)
     else:
@@ -583,6 +716,7 @@ def _commit_staged_day_outputs(staged_paths, final_paths):
     are restored from their backups.
     """
     transaction_id = uuid.uuid4().hex
+    LOGGER.info("COMMIT begin transaction=%s", transaction_id)
     pairs = [
         (
             Path(staged_paths["data_day_folder"]),
@@ -610,16 +744,19 @@ def _commit_staged_day_outputs(staged_paths, final_paths):
             _remove_path(backup_dir)
 
             if final_dir.exists():
+                LOGGER.debug("COMMIT backup %s -> %s", final_dir, backup_dir)
                 final_dir.rename(backup_dir)
                 backups.append((final_dir, backup_dir))
 
         # Staging lives under the same OUTPUT_ROOT, so these are same-filesystem
         # directory renames rather than copy-and-delete operations.
         for staged_dir, final_dir in pairs:
+            LOGGER.debug("COMMIT install %s -> %s", staged_dir, final_dir)
             staged_dir.rename(final_dir)
             installed.append(final_dir)
 
     except Exception:
+        LOGGER.exception("COMMIT failed transaction=%s; rolling back", transaction_id)
         # Remove any partially installed new version.
         for final_dir in reversed(installed):
             _remove_path(final_dir)
@@ -633,6 +770,7 @@ def _commit_staged_day_outputs(staged_paths, final_paths):
     else:
         for _, backup_dir in backups:
             _remove_path(backup_dir)
+        LOGGER.info("COMMIT complete transaction=%s", transaction_id)
 
 
 # ----------------------------------------------------------------------
@@ -642,7 +780,13 @@ def _commit_staged_day_outputs(staged_paths, final_paths):
 def _numbers_row_height(table, row_index):
     try:
         return float(table.row_height(row_index))
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning(
+            "ROW_HEIGHT unable to read table=%s row=%d: %s",
+            getattr(table, "name", "?"),
+            row_index + 1,
+            exc,
+        )
         return None
 
 
@@ -661,6 +805,163 @@ def _explicit_row_height(table, row_index):
         return None
 
     return height
+
+
+def dry_run_numbers_file(numbers_file):
+    """
+    Read and validate one Numbers diary without writing canonical output.
+
+    The dry run opens the document, resolves its diary date, walks every
+    sheet/table/row/cell, exercises the same text/style/link/span/background-image
+    reads used by the real parser, and reads stored row heights. It deliberately
+    does not create CSV, IMG, HTML, .staging, or anything under Diary Export.
+    """
+    numbers_file = Path(numbers_file).expanduser().resolve()
+    started = perf_counter()
+    LOGGER.info("DRY_RUN begin source=%s", numbers_file)
+
+    if not numbers_file.exists():
+        LOGGER.error("DRY_RUN source missing: %s", numbers_file)
+        raise FileNotFoundError(f"Numbers file not found: {numbers_file}")
+
+    if numbers_file.suffix.lower() != ".numbers":
+        LOGGER.error("DRY_RUN wrong extension: %s", numbers_file)
+        raise ValueError(f"Expected a .numbers file: {numbers_file}")
+
+    try:
+        LOGGER.debug("DRY_RUN Document open begin source=%s", numbers_file)
+        doc = Document(str(numbers_file))
+        LOGGER.debug("DRY_RUN Document open complete source=%s", numbers_file)
+        diary_date = _find_diary_date(doc, numbers_file)
+
+        sheet_count = 0
+        table_count = 0
+        row_count = 0
+        cell_count = 0
+        meaningful_cell_count = 0
+        image_count = 0
+        hyperlink_count = 0
+        explicit_height_count = 0
+
+        for sheet_index, sheet in enumerate(doc.sheets):
+            sheet_count += 1
+            LOGGER.debug(
+                "DRY_RUN sheet index=%d name=%s",
+                sheet_index,
+                getattr(sheet, "name", "?"),
+            )
+
+            for table_index, table in enumerate(sheet.tables):
+                table_count += 1
+                source_rows = table.rows()
+                LOGGER.debug(
+                    "DRY_RUN table sheet=%d table=%d name=%s rows=%d",
+                    sheet_index,
+                    table_index,
+                    getattr(table, "name", "?"),
+                    len(source_rows),
+                )
+
+                for source_row_index, row in enumerate(source_rows):
+                    row_count += 1
+                    explicit_height = _explicit_row_height(table, source_row_index)
+                    if explicit_height is not None:
+                        explicit_height_count += 1
+
+                    row_meaningful = 0
+                    for source_col_index in range(len(row)):
+                        cell = table.cell(source_row_index, source_col_index)
+                        cell_count += 1
+
+                        if isinstance(cell, numbers_parser.cell.MergedCell):
+                            continue
+
+                        text_value = _cell_value_as_text(cell)
+                        style = _extract_cell_style(cell)
+                        links = _extract_hyperlinks(cell)
+                        span = _horizontal_span(cell)
+                        hyperlink_count += len(links)
+
+                        bg_image = getattr(getattr(cell, "style", None), "bg_image", None)
+                        has_image = isinstance(bg_image, numbers_parser.cell.BackgroundImage)
+                        if has_image:
+                            image_count += 1
+                            # Access the same payload that real extraction writes, but
+                            # intentionally do not write it anywhere.
+                            image_data = getattr(bg_image, "data", None)
+                            LOGGER.debug(
+                                "DRY_RUN image row=%d col=%d file=%s bytes=%s",
+                                source_row_index + 1,
+                                source_col_index + 1,
+                                getattr(bg_image, "filename", None),
+                                len(image_data) if image_data is not None else None,
+                            )
+
+                        is_meaningful = bool(
+                            text_value
+                            or has_image
+                            or style.get("background") is not None
+                        )
+                        if is_meaningful:
+                            meaningful_cell_count += 1
+                            row_meaningful += 1
+
+                        if span > 1 or links or style.get("background") is not None:
+                            LOGGER.debug(
+                                "DRY_RUN cell row=%d col=%d span=%d text=%s image=%s links=%d background=%s",
+                                source_row_index + 1,
+                                source_col_index + 1,
+                                span,
+                                bool(text_value),
+                                has_image,
+                                len(links),
+                                style.get("background"),
+                            )
+
+                    LOGGER.debug(
+                        "DRY_RUN row=%d physical_cells=%d meaningful_cells=%d explicit_height=%s",
+                        source_row_index + 1,
+                        len(row),
+                        row_meaningful,
+                        explicit_height,
+                    )
+
+        elapsed = perf_counter() - started
+        result = {
+            "source": str(numbers_file),
+            "date": diary_date.isoformat(),
+            "status": "OK",
+            "mode": "dry_run",
+            "sheets": sheet_count,
+            "tables": table_count,
+            "rows": row_count,
+            "cells": cell_count,
+            "meaningful_cells": meaningful_cell_count,
+            "images": image_count,
+            "hyperlinks": hyperlink_count,
+            "explicit_row_heights": explicit_height_count,
+            "elapsed_seconds": elapsed,
+        }
+        LOGGER.info(
+            "DRY_RUN success source=%s date=%s sheets=%d tables=%d rows=%d cells=%d images=%d elapsed=%s",
+            numbers_file,
+            diary_date,
+            sheet_count,
+            table_count,
+            row_count,
+            cell_count,
+            image_count,
+            _format_elapsed(elapsed),
+        )
+        return result
+
+    except Exception:
+        LOGGER.exception(
+            "DRY_RUN failed source=%s elapsed=%s",
+            numbers_file,
+            _format_elapsed(perf_counter() - started),
+        )
+        raise
 
 
 def parse_numbers_file(numbers_file, output_root):
@@ -692,17 +993,34 @@ def parse_numbers_file(numbers_file, output_root):
     """
     numbers_file = Path(numbers_file).expanduser().resolve()
     output_root = Path(output_root).expanduser().resolve()
+    started = perf_counter()
+    LOGGER.info("PARSE begin source=%s output_root=%s", numbers_file, output_root)
 
     if not numbers_file.exists():
+        LOGGER.error("PARSE source missing: %s", numbers_file)
         raise FileNotFoundError(f"Numbers file not found: {numbers_file}")
 
     if numbers_file.suffix.lower() != ".numbers":
+        LOGGER.error("PARSE wrong extension: %s", numbers_file)
         raise ValueError(f"Expected a .numbers file: {numbers_file}")
 
     # Opening the source and determining its diary date do not touch output.
-    doc = Document(str(numbers_file))
-    diary_date = _find_diary_date(doc, numbers_file)
-    final_paths = _build_output_paths(output_root, diary_date)
+    try:
+        LOGGER.debug("PARSE Document open begin source=%s", numbers_file)
+        doc = Document(str(numbers_file))
+        LOGGER.debug("PARSE Document open complete source=%s", numbers_file)
+        diary_date = _find_diary_date(doc, numbers_file)
+        final_paths = _build_output_paths(output_root, diary_date)
+        LOGGER.info("PARSE date=%s source=%s", diary_date, numbers_file)
+        LOGGER.debug("PARSE final_data_dir=%s", final_paths["data_day_folder"])
+        LOGGER.debug("PARSE final_inspection_dir=%s", final_paths["inspection_day_folder"])
+    except Exception:
+        LOGGER.exception(
+            "PARSE failed before staging source=%s elapsed=%s",
+            numbers_file,
+            _format_elapsed(perf_counter() - started),
+        )
+        raise
 
     staging_parent = output_root / ".staging"
     staging_parent.mkdir(parents=True, exist_ok=True)
@@ -713,6 +1031,7 @@ def parse_numbers_file(numbers_file, output_root):
         )
     )
     staged_paths = _build_output_paths(staging_root, diary_date)
+    LOGGER.debug("STAGING created root=%s", staging_root)
 
     try:
         staged_paths["data_day_folder"].mkdir(parents=True, exist_ok=True)
@@ -724,8 +1043,20 @@ def parse_numbers_file(numbers_file, output_root):
         inspection_source_rows = []
 
         for sheet_index, sheet in enumerate(doc.sheets):
+            LOGGER.debug(
+                "PARSE sheet index=%d name=%s",
+                sheet_index,
+                getattr(sheet, "name", "?"),
+            )
             for table_index, table in enumerate(sheet.tables):
                 source_rows = table.rows()
+                LOGGER.debug(
+                    "PARSE table sheet=%d table=%d name=%s rows=%d",
+                    sheet_index,
+                    table_index,
+                    getattr(table, "name", "?"),
+                    len(source_rows),
+                )
 
                 for source_row_index, row in enumerate(source_rows):
                     prepared = {}
@@ -743,8 +1074,18 @@ def parse_numbers_file(numbers_file, output_root):
                         )
                         prepared[source_col_index] = (data_value, props)
 
-                        if props.get("type") != "empty":
+                        if (
+                            props.get("type") != "empty"
+                            or props.get("background") is not None
+                        ):
                             meaningful_cols.append(source_col_index)
+
+                    LOGGER.debug(
+                        "PARSE row=%d physical_cells=%d meaningful_cols=%s",
+                        source_row_index + 1,
+                        len(row),
+                        meaningful_cols,
+                    )
 
                     if not meaningful_cols:
                         inspection_source_rows.append(
@@ -760,6 +1101,12 @@ def parse_numbers_file(numbers_file, output_root):
                         table,
                         source_row_index,
                     )
+                    if explicit_row_height is not None:
+                        LOGGER.debug(
+                            "PARSE explicit row height row=%d height=%s",
+                            source_row_index + 1,
+                            explicit_row_height,
+                        )
 
                     data_row = []
                     property_row = []
@@ -803,6 +1150,15 @@ def parse_numbers_file(numbers_file, output_root):
             for row in property_rows
         ]
 
+        LOGGER.info(
+            "PARSE extracted source=%s records=%d max_logical_items=%d images=%d",
+            numbers_file,
+            len(data_rows),
+            max_items,
+            len(list(staged_paths["img_folder"].iterdir())),
+        )
+
+        LOGGER.debug("CSV write data=%s", staged_paths["csv"])
         with staged_paths["csv"].open(
             "w",
             newline="",
@@ -810,6 +1166,7 @@ def parse_numbers_file(numbers_file, output_root):
         ) as fp:
             csv.writer(fp).writerows(data_rows)
 
+        LOGGER.debug("CSV write properties=%s", staged_paths["properties_csv"])
         with staged_paths["properties_csv"].open(
             "w",
             newline="",
@@ -817,6 +1174,7 @@ def parse_numbers_file(numbers_file, output_root):
         ) as fp:
             csv.writer(fp).writerows(property_rows)
 
+        LOGGER.debug("HTML build begin path=%s", staged_paths["inspection_html"])
         build_inspection_html(
             data_csv_path=staged_paths["csv"],
             properties_csv_path=staged_paths["properties_csv"],
@@ -830,19 +1188,39 @@ def parse_numbers_file(numbers_file, output_root):
             },
         )
 
+        LOGGER.debug("HTML build complete path=%s", staged_paths["inspection_html"])
+
         # This is the only point at which the existing final day can change.
         _commit_staged_day_outputs(staged_paths, final_paths)
+
+    except Exception:
+        LOGGER.exception(
+            "PARSE failed source=%s staging=%s elapsed=%s",
+            numbers_file,
+            staging_root,
+            _format_elapsed(perf_counter() - started),
+        )
+        raise
 
     finally:
         # On parse/build failure, this only removes unfinished staging data.
         # On success, the two staged day directories have already been renamed
         # into final locations, so this removes the now-empty staging tree.
         _remove_path(staging_root)
+        LOGGER.debug("STAGING cleanup root=%s", staging_root)
         try:
             staging_parent.rmdir()
-        except OSError:
+        except OSError as exc:
             # Other concurrent/failed staging transactions may still exist.
-            pass
+            LOGGER.debug("STAGING parent retained path=%s reason=%s", staging_parent, exc)
+
+    elapsed = perf_counter() - started
+    LOGGER.info(
+        "PARSE success source=%s date=%s elapsed=%s",
+        numbers_file,
+        diary_date,
+        _format_elapsed(elapsed),
+    )
 
     return {
         "source": str(numbers_file),
@@ -857,6 +1235,7 @@ def parse_numbers_file(numbers_file, output_root):
         "inspection_folder": str(final_paths["inspection_day_folder"]),
         "inspection_html": str(final_paths["inspection_html"]),
         "transactional": True,
+        "elapsed_seconds": elapsed,
     }
 
 
@@ -879,11 +1258,17 @@ def list_month_folders(year_folder):
         if child.is_dir()
     }
 
-    return [
+    result = [
         by_name[month_name.casefold()]
         for month_name in _MONTH_NAMES
         if month_name.casefold() in by_name
     ]
+    LOGGER.debug(
+        "DISCOVERY year_folder=%s month_folders=%s",
+        year_folder,
+        [p.name for p in result],
+    )
+    return result
 
 
 def _natural_path_sort_key(path):
@@ -909,7 +1294,13 @@ def list_numbers_files(month_folder):
         for path in month_folder.rglob("*.numbers")
         if not path.name.startswith("~$")
     ]
-    return sorted(files, key=_natural_path_sort_key)
+    result = sorted(files, key=_natural_path_sort_key)
+    LOGGER.debug(
+        "DISCOVERY month_folder=%s numbers_files=%d",
+        month_folder,
+        len(result),
+    )
+    return result
 
 
 # ----------------------------------------------------------------------
@@ -926,7 +1317,14 @@ def _property_number(props, key, default=None, cast=float):
 
     try:
         return cast(value)
-    except Exception:
+    except Exception as exc:
+        LOGGER.warning(
+            "PROPERTY invalid numeric value key=%s value=%r cast=%s: %s",
+            key,
+            value,
+            getattr(cast, "__name__", cast),
+            exc,
+        )
         return default
 
 
@@ -939,6 +1337,11 @@ def _build_inspection_payload(
     """Reconstruct inspection data strictly from the canonical dual CSV."""
     data_csv_path = Path(data_csv_path)
     properties_csv_path = Path(properties_csv_path)
+    LOGGER.debug(
+        "INSPECTION payload begin data=%s properties=%s",
+        data_csv_path,
+        properties_csv_path,
+    )
 
     with data_csv_path.open("r", encoding=CSV_ENCODING, newline="") as fp:
         data_rows = list(csv.reader(fp))
@@ -1027,6 +1430,11 @@ def _build_inspection_payload(
             }
         )
 
+    LOGGER.debug(
+        "INSPECTION payload complete records=%d max_physical_columns=%d",
+        len(records),
+        max_physical_columns,
+    )
     return {
         "data_csv": data_csv_path.name,
         "properties_csv": properties_csv_path.name,
@@ -1056,6 +1464,7 @@ def build_inspection_html(
     can be double-clicked in Finder. It references images in data/.../IMG by
     relative path, so the whole Diary Export hierarchy remains portable.
     """
+    LOGGER.debug("INSPECTION HTML begin path=%s", inspection_html_path)
     payload = _build_inspection_payload(
         data_csv_path=data_csv_path,
         properties_csv_path=properties_csv_path,
@@ -1063,9 +1472,11 @@ def build_inspection_html(
         layout_constants=layout_constants,
     )
 
-    return render_standalone_html(
+    result = render_standalone_html(
         payload=payload,
         output_folder=output_folder,
         html_path=inspection_html_path,
     )
+    LOGGER.debug("INSPECTION HTML complete path=%s", result)
+    return result
 
