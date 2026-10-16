@@ -807,6 +807,35 @@ def _explicit_row_height(table, row_index):
     return height
 
 
+def _table_header_counts(table):
+    """
+    Return the Numbers table's structural header counts.
+
+    These are presentation metadata used only by the inspection viewer:
+      - num_header_rows: table header rows (normally 1 in the diary template)
+      - num_header_cols: table header columns (normally 1, the time column)
+
+    Canonical CSV/properties content is intentionally unchanged.
+    """
+    def _read(name):
+        value = getattr(table, name, 0)
+        if callable(value):
+            value = value()
+        try:
+            return max(0, int(value or 0))
+        except Exception as exc:
+            LOGGER.warning(
+                "HEADER unable to read table=%s %s=%r: %s",
+                getattr(table, "name", "?"),
+                name,
+                value,
+                exc,
+            )
+            return 0
+
+    return _read("num_header_rows"), _read("num_header_cols")
+
+
 def dry_run_numbers_file(numbers_file):
     """
     Read and validate one Numbers diary without writing canonical output.
@@ -854,12 +883,15 @@ def dry_run_numbers_file(numbers_file):
             for table_index, table in enumerate(sheet.tables):
                 table_count += 1
                 source_rows = table.rows()
+                num_header_rows, num_header_cols = _table_header_counts(table)
                 LOGGER.debug(
-                    "DRY_RUN table sheet=%d table=%d name=%s rows=%d",
+                    "DRY_RUN table sheet=%d table=%d name=%s rows=%d header_rows=%d header_cols=%d",
                     sheet_index,
                     table_index,
                     getattr(table, "name", "?"),
                     len(source_rows),
+                    num_header_rows,
+                    num_header_cols,
                 )
 
                 for source_row_index, row in enumerate(source_rows):
@@ -1042,6 +1074,11 @@ def parse_numbers_file(numbers_file, output_root):
         property_rows = []
         inspection_source_rows = []
 
+        # Structural Numbers table metadata for the derived inspection viewer.
+        # The canonical dual CSV remains unchanged.
+        inspection_num_header_rows = None
+        inspection_num_header_cols = None
+
         for sheet_index, sheet in enumerate(doc.sheets):
             LOGGER.debug(
                 "PARSE sheet index=%d name=%s",
@@ -1050,12 +1087,34 @@ def parse_numbers_file(numbers_file, output_root):
             )
             for table_index, table in enumerate(sheet.tables):
                 source_rows = table.rows()
+                num_header_rows, num_header_cols = _table_header_counts(table)
+
+                if inspection_num_header_rows is None:
+                    inspection_num_header_rows = num_header_rows
+                    inspection_num_header_cols = num_header_cols
+                elif (
+                    inspection_num_header_rows != num_header_rows
+                    or inspection_num_header_cols != num_header_cols
+                ):
+                    LOGGER.warning(
+                        "HEADER multiple tables use different header counts; "
+                        "inspection uses first table header_rows=%d header_cols=%d, "
+                        "current table=%s has header_rows=%d header_cols=%d",
+                        inspection_num_header_rows,
+                        inspection_num_header_cols,
+                        getattr(table, "name", "?"),
+                        num_header_rows,
+                        num_header_cols,
+                    )
+
                 LOGGER.debug(
-                    "PARSE table sheet=%d table=%d name=%s rows=%d",
+                    "PARSE table sheet=%d table=%d name=%s rows=%d header_rows=%d header_cols=%d",
                     sheet_index,
                     table_index,
                     getattr(table, "name", "?"),
                     len(source_rows),
+                    num_header_rows,
+                    num_header_cols,
                 )
 
                 for source_row_index, row in enumerate(source_rows):
@@ -1185,6 +1244,8 @@ def parse_numbers_file(numbers_file, output_root):
                 "time_column_width": PROPERTY_TIME_COLUMN_WIDTH,
                 "basic_column_width": PROPERTY_BASIC_COLUMN_WIDTH,
                 "source_basic_column_width": NUMBERS_SOURCE_BASIC_COLUMN_WIDTH,
+                "num_header_rows": inspection_num_header_rows or 0,
+                "num_header_cols": inspection_num_header_cols or 0,
             },
         )
 
@@ -1443,6 +1504,8 @@ def _build_inspection_payload(
         "source_basic_column_width": float(
             layout_constants["source_basic_column_width"]
         ),
+        "num_header_rows": int(layout_constants.get("num_header_rows", 0) or 0),
+        "num_header_cols": int(layout_constants.get("num_header_cols", 0) or 0),
         "max_physical_columns": max_physical_columns,
         "source_rows": inspection_source_rows,
         "records": records,

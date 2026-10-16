@@ -68,34 +68,57 @@ thead th {
     z-index: 60;
     height: 28px;
     padding: 3px 6px;
-    background: #bfc0c0;
-    color: #444;
+
+    /*
+     * These are spreadsheet coordinates (A, B, C...),
+     * outside the Numbers table itself.
+     */
+    background: #fff;
+    color: #555;
     font-weight: 500;
     text-align: center;
-    vertical-align: top;
+    vertical-align: middle;
 }
 
-.corner {
+.sheet-corner {
     position: sticky;
     left: 0;
     z-index: 80;
     width: 42px;
     min-width: 42px;
-    background: #bfc0c0;
+    background: #fff;
 }
 
-.row-header {
+.sheet-row-number {
     position: sticky;
     left: 0;
     z-index: 50;
     width: 42px;
     min-width: 42px;
     padding: 3px 7px;
-    background: #ececee;
+    background: #fff;
     color: #555;
     font-weight: 500;
     text-align: right;
     vertical-align: middle;
+}
+
+/*
+ * Numbers table structure:
+ * - Header Row is the darker gray row inside the table.
+ * - Header Column is the lighter gray column inside the table.
+ * The parser supplies their counts from table.num_header_rows/num_header_cols.
+ */
+.table-header-cell {
+    background: #bfc0c0 !important;
+}
+
+.header-column-cell {
+    background: #dedede !important;
+}
+
+.table-header-cell.header-column-cell {
+    background: #bfc0c0 !important;
 }
 
 .diary-cell {
@@ -106,7 +129,6 @@ thead th {
 .time-cell {
     width: var(--time-width);
     min-width: var(--time-width);
-    background: #dedede;
     text-align: center;
     vertical-align: top;
 }
@@ -181,8 +203,8 @@ thead th {
 }
 
 /* Numbers-like header/ruler treatment. */
-.column-header,
-.row-header,
-.corner {
+.sheet-column-letter,
+.sheet-row-number,
+.sheet-corner {
     user-select: none;
 }

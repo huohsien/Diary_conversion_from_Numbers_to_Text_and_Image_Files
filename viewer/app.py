@@ -177,6 +177,8 @@ def _render_table(payload, output_folder, html_path):
         payload.get("source_basic_column_width", NUMBERS_SOURCE_BASIC_COLUMN_WIDTH)
     )
     max_physical_columns = int(payload.get("max_physical_columns", 1))
+    num_header_rows = max(0, int(payload.get("num_header_rows", 0) or 0))
+    num_header_cols = max(0, int(payload.get("num_header_cols", 0) or 0))
 
     records = {
         int(record["record_index"]): record
@@ -198,10 +200,10 @@ def _render_table(payload, output_folder, html_path):
     out.append("</colgroup>")
 
     out.append("<thead><tr>")
-    out.append('<th class="corner"></th>')
+    out.append('<th class="sheet-corner"></th>')
     for col_index in range(max_physical_columns):
         out.append(
-            '<th class="column-header">{}</th>'.format(
+            '<th class="sheet-column-letter">{}</th>'.format(
                 escape(column_name(col_index))
             )
         )
@@ -211,12 +213,23 @@ def _render_table(payload, output_folder, html_path):
     for source_row in payload.get("source_rows", []):
         numbers_row = int(source_row["numbers_row"])
         record_index = source_row.get("record_index")
+        is_header_row = numbers_row <= num_header_rows
+
+        row_classes = ["diary-row"]
+        if is_header_row:
+            row_classes.append("table-header-row")
 
         if record_index is None:
-            out.append('<tr class="diary-row">')
-            out.append(f'<th class="row-header">{numbers_row}</th>')
-            for _ in range(max_physical_columns):
-                out.append('<td class="blank-cell"></td>')
+            out.append('<tr class="{}">'.format(" ".join(row_classes)))
+            out.append(f'<th class="sheet-row-number">{numbers_row}</th>')
+            for physical_col in range(max_physical_columns):
+                if is_header_row:
+                    cell_class = "table-header-cell"
+                elif physical_col < num_header_cols:
+                    cell_class = "header-column-cell"
+                else:
+                    cell_class = "blank-cell"
+                out.append(f'<td class="{cell_class}"></td>')
             out.append("</tr>")
             continue
 
@@ -233,15 +246,16 @@ def _render_table(payload, output_folder, html_path):
                 display_row_height = None
 
         if display_row_height is None:
-            out.append('<tr class="diary-row">')
+            out.append('<tr class="{}">'.format(" ".join(row_classes)))
         else:
             out.append(
-                '<tr class="diary-row" data-explicit-row-height="{}">'.format(
-                    display_row_height
+                '<tr class="{}" data-explicit-row-height="{}">'.format(
+                    " ".join(row_classes),
+                    display_row_height,
                 )
             )
 
-        out.append(f'<th class="row-header">{numbers_row}</th>')
+        out.append(f'<th class="sheet-row-number">{numbers_row}</th>')
 
         cells = record.get("cells", [])
         used_columns = 0
@@ -252,7 +266,14 @@ def _render_table(payload, output_folder, html_path):
             span = max(1, int(cell.get("span", 1)))
             used_columns += span
 
+            physical_col = int(cell.get("physical_col", used_columns - span))
+
             classes = ["diary-cell"]
+            if is_header_row:
+                classes.append("table-header-cell")
+            elif physical_col < num_header_cols:
+                classes.append("header-column-cell")
+
             if item_type == "datetime":
                 classes.append("time-cell")
             if item_type == "empty":
@@ -323,8 +344,14 @@ def _render_table(payload, output_folder, html_path):
 
             out.append("</td>")
 
-        for _ in range(used_columns, max_physical_columns):
-            out.append('<td class="blank-cell"></td>')
+        for physical_col in range(used_columns, max_physical_columns):
+            if is_header_row:
+                cell_class = "table-header-cell"
+            elif physical_col < num_header_cols:
+                cell_class = "header-column-cell"
+            else:
+                cell_class = "blank-cell"
+            out.append(f'<td class="{cell_class}"></td>')
 
         out.append("</tr>")
 
