@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from dataclasses import dataclass
 from datetime import date, datetime
+from io import BytesIO
 import ast
 import csv
 import logging
@@ -17,6 +19,22 @@ from urllib.parse import quote, unquote
 import numbers_parser
 from numbers_parser import Document
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
+    import pillow_heif
+except ImportError:
+    pillow_heif = None
+else:
+    try:
+        pillow_heif.register_heif_opener()
+    except Exception:
+        # Extraction will report a per-image error if HEIF decoding is unavailable.
+        pass
+
 from viewer.app import render_standalone_html
 
 
@@ -25,6 +43,238 @@ CSV_ENCODING = "utf-8-sig"
 PROJECT_ROOT = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("numbers_diary_parser")
 LOGGER.addHandler(logging.NullHandler())
+
+
+IMAGE_DATETIME_COMPLETE = "complete"
+IMAGE_DATETIME_MISSING_TIMEZONE = "missing_timezone"
+IMAGE_DATETIME_UNAVAILABLE = "unavailable"
+IMAGE_DATETIME_ERROR = "error"
+
+_EXIF_DATETIME_CANDIDATES = (
+    ("DateTimeOriginal", 36867, "OffsetTimeOriginal", 36881),
+    ("DateTimeDigitized", 36868, "OffsetTimeDigitized", 36882),
+    ("DateTime", 306, "OffsetTime", 36880),
+)
+
+
+@dataclass(frozen=True)
+class ImageCaptureDatetimeResult:
+    """
+    Result protocol for image capture-time extraction.
+
+    status:
+      - complete: datetime and a usable source timezone offset are both present.
+      - missing_timezone: a valid wall-clock capture datetime exists, but no
+        usable source timezone offset exists. This is NOT an absolute instant.
+      - unavailable: the image is readable, but no supported embedded capture
+        datetime is present.
+      - error: metadata extraction could not be completed reliably.
+
+    `reason` is intentionally reserved for unavailable/error. A
+    missing_timezone result does not duplicate its status with a redundant
+    reason field; more specific diagnostic detail belongs in the run log.
+    """
+
+    status: str
+    datetime_iso: str | None = None
+    datetime_source: str | None = None
+    timezone_offset: str | None = None
+    timezone_source: str | None = None
+    reason: str | None = None
+
+
+def _metadata_text(value):
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    text = str(value).strip().strip("\x00")
+    return text or None
+
+
+def _parse_embedded_datetime(value):
+    text = _metadata_text(value)
+    if not text:
+        return None
+
+    # EXIF normally uses YYYY:MM:DD HH:MM:SS. The alternate forms are accepted
+    # defensively because edited/exported images are not always fully canonical.
+    for fmt in (
+        "%Y:%m:%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y:%m:%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S.%f",
+    ):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _normalize_timezone_offset(value):
+    text = _metadata_text(value)
+    if not text:
+        return None
+
+    if text.upper() == "Z":
+        return "+00:00"
+
+    match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", text)
+    if not match:
+        return None
+
+    sign, hours_text, minutes_text = match.groups()
+    hours = int(hours_text)
+    minutes = int(minutes_text)
+
+    if hours > 23 or minutes > 59:
+        return None
+
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
+def extract_image_capture_datetime(image_data):
+    """
+    Extract capture datetime from ORIGINAL embedded image bytes in memory.
+
+    This function deliberately does not use ZIP/package timestamps, the current
+    Mac timezone/location, diary location, or filesystem creation/modification
+    timestamps. It also does not decode and re-save an intermediate image before
+    reading metadata.
+
+    A byte-for-byte `write_bytes(image_data)` copy can still preserve embedded
+    metadata; the problem is using the NEW FILE'S filesystem timestamp as if it
+    were capture time. Capture time is read here from metadata in the original
+    bytes before any such filesystem interpretation is possible.
+    """
+    if not image_data:
+        return ImageCaptureDatetimeResult(
+            status=IMAGE_DATETIME_ERROR,
+            reason="image_bytes_missing",
+        )
+
+    if Image is None:
+        return ImageCaptureDatetimeResult(
+            status=IMAGE_DATETIME_ERROR,
+            reason="pillow_unavailable",
+        )
+
+    try:
+        with Image.open(BytesIO(bytes(image_data))) as image:
+            exif = image.getexif()
+    except Exception as exc:
+        LOGGER.error(
+            "IMAGE_DATETIME metadata read failed exception=%s detail=%s",
+            type(exc).__name__,
+            exc,
+        )
+        return ImageCaptureDatetimeResult(
+            status=IMAGE_DATETIME_ERROR,
+            reason="metadata_read_error",
+        )
+
+    saw_datetime_field = False
+    saw_unparseable_datetime = False
+
+    for (
+        datetime_name,
+        datetime_tag,
+        timezone_name,
+        timezone_tag,
+    ) in _EXIF_DATETIME_CANDIDATES:
+        raw_datetime = exif.get(datetime_tag)
+        if _metadata_text(raw_datetime) is None:
+            continue
+
+        saw_datetime_field = True
+        parsed_datetime = _parse_embedded_datetime(raw_datetime)
+        if parsed_datetime is None:
+            saw_unparseable_datetime = True
+            LOGGER.warning(
+                "IMAGE_DATETIME unusable %s value=%r",
+                datetime_name,
+                raw_datetime,
+            )
+            continue
+
+        wall_clock_iso = parsed_datetime.isoformat(timespec="seconds")
+        raw_offset = exif.get(timezone_tag)
+        normalized_offset = _normalize_timezone_offset(raw_offset)
+
+        if normalized_offset is not None:
+            return ImageCaptureDatetimeResult(
+                status=IMAGE_DATETIME_COMPLETE,
+                datetime_iso=wall_clock_iso + normalized_offset,
+                datetime_source=datetime_name,
+                timezone_offset=normalized_offset,
+                timezone_source=timezone_name,
+            )
+
+        if _metadata_text(raw_offset) is not None:
+            LOGGER.warning(
+                "IMAGE_DATETIME %s present but unusable value=%r; "
+                "preserving wall-clock datetime with missing_timezone status",
+                timezone_name,
+                raw_offset,
+            )
+
+        # Do not borrow an offset from a lower-priority datetime field. The
+        # preferred capture datetime is preserved, but without pretending it is
+        # an absolute instant when its matching timezone metadata is unavailable.
+        return ImageCaptureDatetimeResult(
+            status=IMAGE_DATETIME_MISSING_TIMEZONE,
+            datetime_iso=wall_clock_iso,
+            datetime_source=datetime_name,
+        )
+
+    if saw_datetime_field and saw_unparseable_datetime:
+        return ImageCaptureDatetimeResult(
+            status=IMAGE_DATETIME_ERROR,
+            reason="embedded_datetime_unparseable",
+        )
+
+    return ImageCaptureDatetimeResult(
+        status=IMAGE_DATETIME_UNAVAILABLE,
+        reason="no_embedded_datetime",
+    )
+
+
+def _image_datetime_properties(result):
+    props = {"image_datetime_status": result.status}
+
+    if result.datetime_iso is not None:
+        props["image_datetime"] = result.datetime_iso
+    if result.datetime_source is not None:
+        props["image_datetime_source"] = result.datetime_source
+    if result.timezone_offset is not None:
+        props["image_timezone_offset"] = result.timezone_offset
+    if result.timezone_source is not None:
+        props["image_timezone_source"] = result.timezone_source
+    if result.reason is not None:
+        props["image_datetime_reason"] = result.reason
+
+    return props
+
+
+def _log_image_datetime_result(result, image_name, context="IMAGE"):
+    fields = (
+        f"{context} image_datetime file={image_name} "
+        f"status={result.status} datetime={result.datetime_iso} "
+        f"source={result.datetime_source} "
+        f"timezone={result.timezone_offset} "
+        f"timezone_source={result.timezone_source} reason={result.reason}"
+    )
+
+    if result.status == IMAGE_DATETIME_COMPLETE:
+        LOGGER.debug(fields)
+    elif result.status in (
+        IMAGE_DATETIME_MISSING_TIMEZONE,
+        IMAGE_DATETIME_UNAVAILABLE,
+    ):
+        LOGGER.warning(fields)
+    else:
+        LOGGER.error(fields)
 
 
 def _numbers_parser_version():
@@ -393,22 +643,36 @@ def _cell_value_as_text(cell):
     return str(value)
 def _extract_background_image(cell, img_dir):
     if isinstance(cell, numbers_parser.cell.MergedCell):
-        return None
+        return None, None
 
     style = getattr(cell, "style", None)
     if style is None:
-        return None
+        return None, None
 
     bg_image = getattr(style, "bg_image", None)
 
     if not isinstance(bg_image, numbers_parser.cell.BackgroundImage):
-        return None
+        return None, None
 
     image_data = getattr(bg_image, "data", None)
     if image_data is None:
-        return None
+        result = ImageCaptureDatetimeResult(
+            status=IMAGE_DATETIME_ERROR,
+            reason="image_bytes_missing",
+        )
+        _log_image_datetime_result(
+            result,
+            getattr(bg_image, "filename", None) or "image",
+        )
+        return None, result
 
     original_filename = getattr(bg_image, "filename", None) or "image"
+
+    # Extract semantic metadata from the ORIGINAL bytes in RAM. The subsequent
+    # write_bytes() call is only the canonical byte-for-byte image export.
+    datetime_result = extract_image_capture_datetime(image_data)
+    _log_image_datetime_result(datetime_result, original_filename)
+
     destination = _unique_destination_path(img_dir, original_filename)
     destination.write_bytes(image_data)
     LOGGER.debug(
@@ -417,7 +681,7 @@ def _extract_background_image(cell, img_dir):
         len(image_data),
     )
 
-    return destination.name
+    return destination.name, datetime_result
 
 
 def _horizontal_span(cell):
@@ -456,7 +720,7 @@ def _logical_item_from_cell(cell, img_dir):
         return None
 
     text_value = _cell_value_as_text(cell)
-    image_filename = _extract_background_image(cell, img_dir)
+    image_filename, image_datetime_result = _extract_background_image(cell, img_dir)
     span = _horizontal_span(cell)
     style = _extract_cell_style(cell)
     hyperlinks = _extract_hyperlinks(cell)
@@ -488,6 +752,9 @@ def _logical_item_from_cell(cell, img_dir):
 
     if item_type == "text_image":
         props["image_file"] = image_filename
+
+    if image_datetime_result is not None:
+        props.update(_image_datetime_properties(image_datetime_result))
 
     if item_type in ("text", "text_image"):
         for key in (
@@ -869,6 +1136,12 @@ def dry_run_numbers_file(numbers_file):
         cell_count = 0
         meaningful_cell_count = 0
         image_count = 0
+        image_datetime_counts = {
+            IMAGE_DATETIME_COMPLETE: 0,
+            IMAGE_DATETIME_MISSING_TIMEZONE: 0,
+            IMAGE_DATETIME_UNAVAILABLE: 0,
+            IMAGE_DATETIME_ERROR: 0,
+        }
         hyperlink_count = 0
         explicit_height_count = 0
 
@@ -921,6 +1194,13 @@ def dry_run_numbers_file(numbers_file):
                             # Access the same payload that real extraction writes, but
                             # intentionally do not write it anywhere.
                             image_data = getattr(bg_image, "data", None)
+                            datetime_result = extract_image_capture_datetime(image_data)
+                            image_datetime_counts[datetime_result.status] += 1
+                            _log_image_datetime_result(
+                                datetime_result,
+                                getattr(bg_image, "filename", None) or "image",
+                                context="DRY_RUN",
+                            )
                             LOGGER.debug(
                                 "DRY_RUN image row=%d col=%d file=%s bytes=%s",
                                 source_row_index + 1,
@@ -970,6 +1250,14 @@ def dry_run_numbers_file(numbers_file):
             "cells": cell_count,
             "meaningful_cells": meaningful_cell_count,
             "images": image_count,
+            "image_datetime_complete": image_datetime_counts[IMAGE_DATETIME_COMPLETE],
+            "image_datetime_missing_timezone": image_datetime_counts[
+                IMAGE_DATETIME_MISSING_TIMEZONE
+            ],
+            "image_datetime_unavailable": image_datetime_counts[
+                IMAGE_DATETIME_UNAVAILABLE
+            ],
+            "image_datetime_error": image_datetime_counts[IMAGE_DATETIME_ERROR],
             "hyperlinks": hyperlink_count,
             "explicit_row_heights": explicit_height_count,
             "elapsed_seconds": elapsed,
@@ -1478,6 +1766,12 @@ def _build_inspection_payload(
                     "image_file": (
                         value if item_type == "image" else props.get("image_file")
                     ),
+                    "image_datetime_status": props.get("image_datetime_status"),
+                    "image_datetime": props.get("image_datetime"),
+                    "image_datetime_source": props.get("image_datetime_source"),
+                    "image_timezone_offset": props.get("image_timezone_offset"),
+                    "image_timezone_source": props.get("image_timezone_source"),
+                    "image_datetime_reason": props.get("image_datetime_reason"),
                 }
             )
             physical_col += span

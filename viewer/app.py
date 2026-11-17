@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime
 from html import escape
 import logging
 import os
 from pathlib import Path
 from urllib.parse import quote
+
 
 
 APP_ROOT = Path(__file__).resolve().parent
@@ -144,6 +146,73 @@ def _image_src(html_path, output_folder, image_file):
     relative = os.path.relpath(image_path, start=Path(html_path).parent)
     return quote(Path(relative).as_posix(), safe="/._-~")
 
+
+
+
+def _inspection_datetime_text(cell):
+    """
+    Inspection display policy is intentionally simpler than canonical storage.
+
+    complete and missing_timezone both display only HH:MM:SS.
+    The canonical timezone status remains in properties.csv and in the title
+    metadata, but the visual strip does not show the date, timezone offset, or
+    TZ? marker. unavailable images get no strip at all.
+    """
+    status = cell.get("image_datetime_status")
+    value = cell.get("image_datetime")
+
+    if status in ("complete", "missing_timezone") and value:
+        try:
+            parsed = datetime.fromisoformat(str(value))
+            return parsed.strftime("%H:%M:%S")
+        except Exception:
+            text = str(value).replace("T", " ")
+            match = re.search(r"(\d{2}:\d{2}:\d{2})", text)
+            return match.group(1) if match else text
+
+    if status == "error":
+        return "DATETIME ERROR"
+
+    return None
+
+
+def _inspection_datetime_title(cell):
+    fields = [
+        ("status", cell.get("image_datetime_status")),
+        ("datetime", cell.get("image_datetime")),
+        ("datetime_source", cell.get("image_datetime_source")),
+        ("timezone_offset", cell.get("image_timezone_offset")),
+        ("timezone_source", cell.get("image_timezone_source")),
+        ("reason", cell.get("image_datetime_reason")),
+    ]
+    return "; ".join(f"{key}={value}" for key, value in fields if value not in (None, ""))
+
+
+def _render_image_block(cell, output_folder, html_path):
+    image_file = cell.get("image_file")
+    if not image_file:
+        return ""
+
+    image_src = escape(
+        _image_src(html_path, output_folder, image_file),
+        quote=True,
+    )
+    stamp_text = _inspection_datetime_text(cell)
+
+    if stamp_text is None:
+        return f'<div class="image-fit"><img src="{image_src}" loading="lazy"></div>'
+
+    title = escape(_inspection_datetime_title(cell), quote=True)
+
+    return (
+        '<div class="image-fit">'
+        '<div class="image-stamp-stack">'
+        f'<img src="{image_src}" loading="lazy">'
+        '<div class="image-datetime-strip" '
+        f'title="{title}">{escape(stamp_text)}</div>'
+        '</div>'
+        '</div>'
+    )
 
 def _text_html(text, links):
     pieces = []
@@ -320,26 +389,12 @@ def _render_table(payload, output_folder, html_path):
                 image_file = cell.get("image_file")
                 if item_type == "text_image" and image_file:
                     out.append(
-                        '<div class="image-fit"><img src="{}" loading="lazy"></div>'.format(
-                            escape(
-                                _image_src(html_path, output_folder, image_file),
-                                quote=True,
-                            )
-                        )
+                        _render_image_block(cell, output_folder, html_path)
                     )
 
             elif item_type == "image" and cell.get("image_file"):
                 out.append(
-                    '<div class="image-fit"><img src="{}" loading="lazy"></div>'.format(
-                        escape(
-                            _image_src(
-                                html_path,
-                                output_folder,
-                                cell["image_file"],
-                            ),
-                            quote=True,
-                        )
-                    )
+                    _render_image_block(cell, output_folder, html_path)
                 )
 
             out.append("</td>")

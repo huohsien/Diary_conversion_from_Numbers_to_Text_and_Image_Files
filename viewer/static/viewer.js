@@ -7,6 +7,40 @@
         return Number.isFinite(n) ? n : 0;
     }
 
+    const STAMP_HEIGHT = 18;
+
+    function fitStampToRenderedImage(fit, targetHeight) {
+        const stack = fit.querySelector(".image-stamp-stack");
+        const img = fit.querySelector("img");
+        const strip = fit.querySelector(".image-datetime-strip");
+
+        if (!stack || !img || !strip) return;
+
+        // The strip is outside the image pixels but inside the inspection image
+        // box. Reserve vertical space for it instead of overlaying the photo.
+        const imageHeight = Math.max(1, targetHeight - STAMP_HEIGHT);
+        stack.style.maxHeight = `${Math.ceil(targetHeight)}px`;
+        img.style.maxHeight = `${Math.ceil(imageHeight)}px`;
+
+        // Recalculate from the rendered image on every layout/resize. This keeps
+        // the timestamp bar exactly as wide as the displayed image, not the cell.
+        stack.style.width = "";
+        strip.style.width = "";
+
+        const renderedWidth = Math.ceil(img.getBoundingClientRect().width);
+        if (renderedWidth <= 0) return;
+
+        stack.style.width = `${renderedWidth}px`;
+        strip.style.width = `${renderedWidth}px`;
+
+        let fontSize = 10;
+        if (renderedWidth < 155) fontSize = 9;
+        if (renderedWidth < 135) fontSize = 8;
+        if (renderedWidth < 115) fontSize = 7;
+        if (renderedWidth < 95) fontSize = 6;
+        strip.style.fontSize = `${fontSize}px`;
+    }
+
     function layoutRows() {
         const table = document.querySelector("table");
         if (!table) return;
@@ -47,7 +81,12 @@
             });
 
             if (textBlocks.length === 0 && imageFits.length > 0) {
-                targetHeight = basicWidth;
+                const hasTimestampStrip = imageFits.some(
+                    (fit) => fit.querySelector(".image-datetime-strip")
+                );
+                // Preserve the old square image baseline and add the inspection
+                // strip below it instead of shrinking image-only rows.
+                targetHeight = basicWidth + (hasTimestampStrip ? STAMP_HEIGHT : 0);
             }
 
             // Explicit/manual Numbers row heights are preserved in the canonical
@@ -72,6 +111,7 @@
 
             imageFits.forEach((fit) => {
                 fit.style.height = `${Math.ceil(targetHeight)}px`;
+                fitStampToRenderedImage(fit, targetHeight);
             });
         });
     }
