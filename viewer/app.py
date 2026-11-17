@@ -4,8 +4,26 @@ from datetime import datetime
 from html import escape
 import logging
 import os
+import re
+import hashlib
 from pathlib import Path
 from urllib.parse import quote
+
+try:
+    from PIL import Image, ImageOps
+except ImportError:
+    Image = None
+    ImageOps = None
+
+try:
+    import pillow_heif
+except ImportError:
+    pillow_heif = None
+else:
+    try:
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
 
 
 
@@ -147,6 +165,73 @@ def _image_src(html_path, output_folder, image_file):
     return quote(Path(relative).as_posix(), safe="/._-~")
 
 
+def _path_src(html_path, target_path):
+    relative = os.path.relpath(Path(target_path), start=Path(html_path).parent)
+    return quote(Path(relative).as_posix(), safe="/._-~")
+
+
+def _inspection_thumbnail(output_folder, html_path, image_file):
+    """
+    Build a derived preview under _inspection and return
+    (preview_src, width, height).
+
+    The canonical data/.../IMG image remains untouched. If thumbnail generation
+    fails, fall back to the canonical image.
+    """
+    source_path = Path(output_folder) / "IMG" / str(image_file)
+
+    if Image is None:
+        return _image_src(html_path, output_folder, image_file), None, None
+
+    try:
+        digest = hashlib.sha1(str(image_file).encode("utf-8")).hexdigest()[:10]
+        thumb_dir = Path(html_path).parent / "_thumbs"
+        thumb_dir.mkdir(parents=True, exist_ok=True)
+        thumb_path = thumb_dir / f"{Path(str(image_file)).stem}-{digest}.jpg"
+
+        with Image.open(source_path) as image:
+            if ImageOps is not None:
+                image = ImageOps.exif_transpose(image)
+
+            image.thumbnail((480, 480), Image.Resampling.LANCZOS)
+
+            if image.mode in ("RGBA", "LA") or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+                background.alpha_composite(rgba)
+                preview = background.convert("RGB")
+            else:
+                preview = image.convert("RGB")
+
+            width, height = preview.size
+            preview.save(
+                thumb_path,
+                format="JPEG",
+                quality=88,
+                optimize=True,
+                progressive=True,
+            )
+
+        return _path_src(html_path, thumb_path), int(width), int(height)
+
+    except Exception as exc:
+        LOGGER.debug(
+            "VIEWER thumbnail fallback image=%s reason=%s",
+            source_path,
+            exc,
+        )
+        try:
+            with Image.open(source_path) as image:
+                width, height = image.size
+            return (
+                _image_src(html_path, output_folder, image_file),
+                int(width),
+                int(height),
+            )
+        except Exception:
+            return _image_src(html_path, output_folder, image_file), None, None
+
+
 
 
 def _inspection_datetime_text(cell):
@@ -193,26 +278,48 @@ def _render_image_block(cell, output_folder, html_path):
     if not image_file:
         return ""
 
-    image_src = escape(
+    original_src = escape(
         _image_src(html_path, output_folder, image_file),
         quote=True,
     )
+    preview_src, preview_width, preview_height = _inspection_thumbnail(
+        output_folder,
+        html_path,
+        image_file,
+    )
+    preview_src = escape(preview_src, quote=True)
+
+    size_attrs = ""
+    if preview_width and preview_height:
+        size_attrs = (
+            f' width="{int(preview_width)}"'
+            f' height="{int(preview_height)}"'
+        )
+
+    image_html = (
+        f'<a class="image-original-link" href="{original_src}" '
+        'target="_blank" rel="noopener">'
+        f'<img src="{preview_src}"{size_attrs} decoding="async">'
+        '</a>'
+    )
+
     stamp_text = _inspection_datetime_text(cell)
 
     if stamp_text is None:
-        return f'<div class="image-fit"><img src="{image_src}" loading="lazy"></div>'
+        return f'<div class="image-fit">{image_html}</div>'
 
     title = escape(_inspection_datetime_title(cell), quote=True)
 
     return (
         '<div class="image-fit">'
         '<div class="image-stamp-stack">'
-        f'<img src="{image_src}" loading="lazy">'
+        f'{image_html}'
         '<div class="image-datetime-strip" '
         f'title="{title}">{escape(stamp_text)}</div>'
         '</div>'
         '</div>'
     )
+
 
 def _text_html(text, links):
     pieces = []
