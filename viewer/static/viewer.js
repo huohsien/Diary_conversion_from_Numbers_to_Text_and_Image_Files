@@ -7,26 +7,6 @@
         return Number.isFinite(n) ? n : 0;
     }
 
-    const STAMP_HEIGHT = 18;
-
-    function fitStampedImageHeight(fit, targetHeight) {
-        const stack = fit.querySelector(".image-stamp-stack");
-        const link = fit.querySelector(".image-original-link");
-        const img = fit.querySelector("img");
-        const strip = fit.querySelector(".image-datetime-strip");
-
-        if (!stack || !img || !strip) return;
-
-        const imageHeight = Math.max(1, targetHeight - STAMP_HEIGHT);
-        stack.style.maxHeight = `${Math.ceil(targetHeight)}px`;
-
-        if (link) {
-            link.style.maxHeight = `${Math.ceil(imageHeight)}px`;
-        }
-
-        img.style.maxHeight = `${Math.ceil(imageHeight)}px`;
-    }
-
     function layoutRows() {
         const table = document.querySelector("table");
         if (!table) return;
@@ -67,12 +47,9 @@
             });
 
             if (textBlocks.length === 0 && imageFits.length > 0) {
-                const hasTimestampStrip = imageFits.some(
-                    (fit) => fit.querySelector(".image-datetime-strip")
-                );
-                // Preserve the old square image baseline and add the inspection
-                // strip below it instead of shrinking image-only rows.
-                targetHeight = basicWidth + (hasTimestampStrip ? STAMP_HEIGHT : 0);
+                // Only the image determines the square row baseline. The
+                // cell-bottom timestamp is absolute and takes no layout space.
+                targetHeight = basicWidth;
             }
 
             // Explicit/manual Numbers row heights are preserved in the canonical
@@ -97,7 +74,6 @@
 
             imageFits.forEach((fit) => {
                 fit.style.height = `${Math.ceil(targetHeight)}px`;
-                fitStampedImageHeight(fit, targetHeight);
             });
         });
     }

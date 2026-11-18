@@ -310,14 +310,13 @@ def _render_image_block(cell, output_folder, html_path):
 
     title = escape(_inspection_datetime_title(cell), quote=True)
 
+    # The strip is a TD-level inspection annotation, not an image caption.
+    # Keep the same image-fit DOM for stamped and unstamped images so the
+    # timestamp cannot change image fitting or the row's intrinsic height.
     return (
-        '<div class="image-fit">'
-        '<div class="image-stamp-stack">'
-        f'{image_html}'
+        f'<div class="image-fit">{image_html}</div>'
         '<div class="image-datetime-strip" '
         f'title="{title}">{escape(stamp_text)}</div>'
-        '</div>'
-        '</div>'
     )
 
 
@@ -456,6 +455,10 @@ def _render_table(payload, output_folder, html_path):
                 classes.append("empty-cell")
             if item_type == "image":
                 classes.append("image-cell")
+            if item_type in ("image", "text_image") and cell.get("image_file"):
+                # Position a possible timestamp against the entire TD, even
+                # when this logical cell contains both text and an image.
+                classes.append("image-annotation-cell")
 
             attrs = [
                 f'colspan="{span}"',
